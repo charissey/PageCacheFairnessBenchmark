@@ -10,12 +10,6 @@
  * This file drives fio, sets up cgroups, samples pressure/dirty-page state,
  * and snapshots per-cgroup memory.stat before/after each phase.
  *
- * TODO features implemented here (see README "Planned fields"):
- *   [TODO-1] phase_N_random_distribution (e.g. zipf:1.2) for the victim hot set
- *   [TODO-2] phase_N_fdatasync / phase_N_fsync flush cadence (checkpoint / WAL)
- *   [TODO-3] /proc/vmstat nr_dirty / nr_writeback + per-cgroup file_dirty
- *            sampled at 1s intervals into the results dir
- *
  * Platform: cgroups, PSI, memory.stat, and /proc/vmstat require Linux
  * (cgroup v2). macOS is build-only; the sampler/cgroup paths no-op there.
  */
@@ -56,10 +50,10 @@ typedef struct {
     int   runtime;                    /* seconds                             */
     int   rwmixread;                  /* for randrw; -1 = unset              */
 
-    /* [TODO-1] victim access-distribution skew */
+    /* victim access-distribution skew */
     char  random_distribution[MAX_STR]; /* "" or e.g. "zipf:1.2"             */
 
-    /* [TODO-2] flush cadence for checkpoint / WAL B variants */
+    /* flush cadence for checkpoint / WAL B variants */
     int   fdatasync;                  /* fdatasync every N ops; 0 = unset    */
     int   fsync;                      /* fsync every N ops; 0 = unset        */
 } PhaseConfig;
@@ -119,6 +113,7 @@ static const char CGROUP_ROOT[] = "/sys/fs/cgroup";
  * ------------------------------------------------------------------ */
 
 static char *trim(char *s) {
+    /* trim leading and trailing whitespace */
     while (*s && isspace((unsigned char)*s)) s++;
     if (!*s) return s;
     char *end = s + strlen(s) - 1;
@@ -127,6 +122,7 @@ static char *trim(char *s) {
 }
 
 static bool is_linux(void) {
+    /* check if the platform is Linux (required for cgroup v2) */
 #ifdef __linux__
     return true;
 #else
@@ -135,12 +131,14 @@ static bool is_linux(void) {
 }
 
 static void ensure_dir(const char *path) {
+    /* create the directory if it doesn't exist */
     if (mkdir(path, 0755) != 0 && errno != EEXIST)
         INFO("warning: mkdir %s: %s", path, strerror(errno));
 }
 
 /* mkdir -p for a subdir under the results dir */
 static void ensure_subdir(const char *base, const char *sub, char *out, size_t n) {
+    /* builds base/sub and creates the directory into out if it doesn't exist */
     snprintf(out, n, "%s/%s", base, sub);
     ensure_dir(out);
 }
@@ -159,9 +157,9 @@ static void apply_phase_key(PhaseConfig *p, const char *key, const char *val) {
     else if (!strcmp(key, "numjobs"))             p->numjobs   = atoi(val);
     else if (!strcmp(key, "runtime"))             p->runtime   = atoi(val);
     else if (!strcmp(key, "rwmixread"))           p->rwmixread = atoi(val);
-    /* [TODO-1] */
+    /* victim access-distribution skew */
     else if (!strcmp(key, "random_distribution")) snprintf(p->random_distribution, MAX_STR, "%s", val);
-    /* [TODO-2] */
+    /* flush cadence for checkpoint / WAL B variants */
     else if (!strcmp(key, "fdatasync"))           p->fdatasync = atoi(val);
     else if (!strcmp(key, "fsync"))               p->fsync     = atoi(val);
     else VLOG("unknown phase key '%s' (ignored)", key);
@@ -169,6 +167,7 @@ static void apply_phase_key(PhaseConfig *p, const char *key, const char *val) {
 }
 
 static void init_phase(PhaseConfig *p) {
+    /* default values */
     memset(p, 0, sizeof(*p));
     p->rwmixread = -1;
     p->iodepth   = 1;
@@ -181,11 +180,13 @@ static void init_phase(PhaseConfig *p) {
 
 static ClientConfig *find_or_add_client(Config *cfg, const char *name) {
     for (int i = 0; i < cfg->num_clients; i++)
-        if (!strcmp(cfg->clients[i].name, name)) return &cfg->clients[i];
+    /* check if the client name already exists and return the client config */
+    if (!strcmp(cfg->clients[i].name, name)) return &cfg->clients[i];
     if (cfg->num_clients >= MAX_CLIENTS) {
         INFO("error: too many client sections (max %d)", MAX_CLIENTS);
         exit(1);
     }
+    /* add the new client config */
     ClientConfig *c = &cfg->clients[cfg->num_clients++];
     memset(c, 0, sizeof(*c));
     snprintf(c->name, MAX_STR, "%s", name);
@@ -396,13 +397,19 @@ static void record_memstat(const char *cgroup_name, const char *client,
 }
 
 /* ------------------------------------------------------------------ *
- * Telemetry sampler: [TODO-3] /proc/vmstat + per-cgroup file_dirty,
+ * Telemetry sampler: /proc/vmstat + per-cgroup file_dirty,
  * plus per-cgroup PSI (memory.pressure / io.pressure) time series.
  * ------------------------------------------------------------------ */
 
 static volatile sig_atomic_t sampler_stop = 0;
 static void sampler_sig(int sig) { (void)sig; sampler_stop = 1; }
 
+/* System-wide memory counters
+ * nr_dirty: number of pages changes but not yet flushed to disk
+ * nr_writeback: number of pages actively flushed to disk
+ * pgpgin: number of pages read from disk
+ * pgscan_kswapd: number of pages scanned in the LRU list for eviction
+ */
 static long read_vmstat_field(const char *field) {
     FILE *f = fopen("/proc/vmstat", "r");
     if (!f) return -1;

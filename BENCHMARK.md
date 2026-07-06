@@ -1,5 +1,4 @@
 # Pagecache Fairness Benchmark (C)
-Additional Benchmarks for https://github.com/SoujanyaPonnapalli/PageCache-Fairness
 
 This repository contains a focused benchmarking suite to measure **page-cache
 performance isolation failures** between co-located tenants — specifically the
