@@ -132,8 +132,27 @@ static bool is_linux(void) {
 
 static void ensure_dir(const char *path) {
     /* create the directory if it doesn't exist */
-    if (mkdir(path, 0755) != 0 && errno != EEXIST)
-        INFO("warning: mkdir %s: %s", path, strerror(errno));
+    if (!path || !*path) return;
+
+    char buf[MAX_CMD];
+    if (snprintf(buf, sizeof(buf), "%s", path) >= (int)sizeof(buf)) {
+        INFO("warning: mkdir path too long: %s", path);
+        return;
+    }
+
+    size_t len = strlen(buf);
+    if (len > 1 && buf[len - 1] == '/')
+        buf[len - 1] = '\0';
+
+    for (char *p = buf + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+            INFO("warning: mkdir %s: %s", buf, strerror(errno));
+        *p = '/';
+    }
+    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+        INFO("warning: mkdir %s: %s", buf, strerror(errno));
 }
 
 /* mkdir -p for a subdir under the results dir */
