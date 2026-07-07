@@ -4,10 +4,7 @@ This document explains, in detail, **what this benchmark does, how the code is
 structured, what it measures, and the exact step-by-step commands to run the
 experiments on a Linux host.**
 
-It accompanies the research spec in `BENCHMARK.md` (usage/thesis) and the
-implementation plan in `README.md` (phased TODO checklist). Where those two
-describe *what* to build, this file describes *what was built here* and *how to
-operate it*.
+It accompanies the research spec and implementation plan in `README.md. Where that describes *what* to build, this file describes *what was built here* and *how to operate it*.
 
 > **Platform:** the interference experiments require **Linux with cgroup v2**.
 > Everything cgroup/PSI/`memory.stat`/`/proc/vmstat`/`iostat`-related is
@@ -394,8 +391,7 @@ phase_0_ioengine = libaio
 
 ## 13. Relationship to the repo's own docs
 
-- `BENCHMARK.md` — the usage/thesis spec (what to run, expected outcomes).
-- `README.md` — the phased implementation plan (Phase 0–6 checklist). This
+- `README.md` — the usage/thesis spec (what to run, expected outcomes).
   build corresponds to that plan collapsed into a single `benchmark.c` +
   `benchmark_analysis.py` rather than the multi-file `src/*.c` layout it
   sketches; the config keys, workloads, telemetry, and experiment cases match.

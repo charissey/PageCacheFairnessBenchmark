@@ -1,184 +1,520 @@
-# Page Cache Fairness Benchmark for Bounding p99 Latency Spikes in Multi-Tenant KV Stores
-Additional Benchmarks for https://github.com/SoujanyaPonnapalli/PageCache-Fairness
+# Pagecache Fairness Benchmark (C)
 
-This project investigates and addresses performance isolation failures in the Linux OS page cache for co-located multi-tenant key-value store workloads. We focus on bounding p99 read latency spikes — a problem that existing OS mechanisms leave unsolved.
+This repository contains a focused benchmarking suite to measure **page-cache
+performance isolation failures** between co-located tenants — specifically the
+**p99 read-latency spike** a latency-sensitive reader (Tenant A) suffers when a
+noisy neighbor (Tenant B) shares the page cache.
 
----
+## 🎯 Purpose
 
-## Motivation and Context
-
-[Delta Fair Sharing](https://arxiv.org/abs/2601.20030) (ArXiv '26) addresses performance isolation for RocksDB's *internal* resources (write buffer, read cache). For the **OS page cache**, the paper identifies interference as an open problem but does not provide a solution. That is the gap this project fills.
-
-**The interference mechanism** *(hypothesis we aim to validate experimentally)*: When tenant B exceeds its fair share of page cache, it evicts tenant A's pages from the LRU. A then reads up to its fair share, encounters cache misses, and issues disk reads. If B is also write-heavy, kswapd/the flusher concurrently drains B's dirty pages to disk. A's reads land in the I/O queue *behind* B's writeback flushes. A's effective read latency = writeback drain time + disk read time — far higher than a baseline disk read alone. The dirty writeback does not bypass cache eviction; it **amplifies the per-miss penalty** on top of it.
-
-**Why existing approaches miss this interference**: [cgroup memory limits](https://docs.kernel.org/admin-guide/cgroup-v2.html) and PSI-based tools like [Senpai](https://github.com/facebookincubator/senpai) act on total cached pages — they can reduce how much B evicts A, but even with perfect memory sizing, B's dirty page flushes still contend with A's reads at the I/O scheduler. PSI fires correctly for A's elevated stall but triggers the wrong remedy (memory limit adjustment) when the root cause is I/O queue contention from B's writeback.
-
-## How the Linux Page Cache Works (and Why It Fails)
-
-### Default Policy
-
-The Linux page cache stores file-backed data in DRAM to avoid repeated disk reads. It is managed as a **two-list LRU** (inactive + active) per NUMA node, implemented in [`mm/vmscan.c`](https://elixir.bootlin.com/linux/latest/source/mm/vmscan.c):
-
-- **Insertion:** A page read for the first time (`add_to_page_cache_lru()`) lands on the **inactive list**. On second access it is promoted to the **active list**.
-- **Eviction under pressure:** `kswapd` wakes when free memory falls below a watermark, calls `shrink_lruvec()` → `shrink_page_list()`, and evicts cold pages from the tail of the inactive list.
-- **Scan pollution:** A large sequential scan fills the inactive list and pushes out hot working-set pages before they can be promoted — the root cause of noisy-neighbor interference.
-- **No tenant awareness:** All pages on the inactive list compete equally — no notion of per-tenant priority.
-
-### How cgroups Are Applied Per Process
-
-Memory cgroup (memcg) tracking is wired into the page fault and page cache insertion paths ([`mm/memcontrol.c`](https://elixir.bootlin.com/linux/latest/source/mm/memcontrol.c)):
-
-1. **Charge on first access:** Each page is charged to the cgroup of the faulting process and retains that association until eviction.
-2. **Per-cgroup LRU lists:** Each cgroup maintains its own inactive/active LRU (`mem_cgroup_lruvec()`). The global shrinker walks per-cgroup LRU vectors proportionally under memory pressure.
-3. **`memory.low` / `memory.min` influence eviction priority:** `shrink_lruvec()` skips cgroups below their `memory.low` or `memory.min` thresholds — the *only* place tenant identity influences eviction order.
-4. **Shared file pages:** A file-backed page is charged to the first-accessing cgroup; subsequent readers benefit without being charged.
-
-### cgroup v2 Memory Knobs
-
-| Knob | Description |
-|---|---|
-| `memory.min` | Hard memory floor: pages below this threshold are never reclaimed, even under system-wide pressure. Enforcement: the kernel skips this cgroup entirely during reclaim until no other memory is available. |
-| `memory.low` | Soft memory floor: pages below this threshold are deprioritized for eviction relative to cgroups that are over their limit. Best-effort — the kernel may still reclaim under heavy global pressure. |
-| `memory.high` | Soft ceiling: when usage exceeds this, the kernel throttles the cgroup's allocations and forces it into reclaim. Does not kill processes; used to apply sustained memory pressure. Also has the side effect of triggering writeback of dirty pages belonging to the cgroup. |
-| `memory.max` | Hard ceiling: exceeding this triggers the OOM killer for processes in the cgroup. |
-
-These knobs provide limit-based isolation, not fairness-based isolation. They tell the kernel how much memory each tenant *may* use, but do not control eviction ordering when two tenants both exceed their soft limits, and have no visibility into whether evictions are clean (free) or dirty (require writeback I/O).
-
-**The dirty/clean blind spot:** All four knobs count *total* file-backed pages — clean and dirty together. `memory.stat` exposes `file_dirty` per cgroup, but there is no per-cgroup throttle on dirty page accumulation rate (only global `vm.dirty_background_ratio` / `vm.dirty_ratio`). A cgroup that accumulates many dirty pages and then flushes them generates a writeback burst that competes with other tenants' reads at the I/O scheduler — an interference path the memory controller can observe (via `file_dirty`) but cannot directly act on.
-
-**Standard practice** ([Biriukov](https://biriukov.dev/docs/page-cache/6-cgroup-v2-and-page-cache/), [Kubernetes etcd guide](https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/)): set `memory.low ≈ observed working set`, `memory.high ≈ 90% of container limit`, `memory.max` as hard ceiling. No universal percentages — requires monitoring actual usage.
-
-### Dynamic / Adaptive cgroup Configuration
-
-Rather than static limits, several systems use runtime PSI feedback:
-
-**PSI as a feedback signal.** Linux 4.20+ exposes `/sys/fs/cgroup/<path>/memory.pressure` per cgroup. Subscribe to threshold-crossing events via `eventfd`:
-```
-# fire when memory stall exceeds 50ms in any 500ms window
-echo "some 50000 500000" > /sys/fs/cgroup/tenant_a/memory.pressure
-```
-
-**[Senpai](https://github.com/facebookincubator/senpai) (Meta):** Monitors `memory.pressure`; lowers `memory.high` when pressure is below target (page out cold memory) and raises it when pressure rises. Deployed across millions of Meta servers; 20–32% memory savings ([TMO, ASPLOS '22](https://www.cs.cmu.edu/~dskarlat/publications/tmo_asplos22.pdf)).
-
-**WSS estimation for `memory.low` sizing:** [Cuki (ATC '23)](https://www.usenix.org/system/files/atc23-gu.pdf) and [eBPF-based WSS estimation](https://arxiv.org/pdf/2303.05919) estimate per-cgroup working set size online, enabling automatic `memory.low` sizing.
-
-**MRC-guided partitioning:** [mPart (ISMM '18)](https://dl.acm.org/doi/10.1145/3210563.3210571) constructs online miss-ratio curves per tenant and solves for the near-optimal allocation split.
-
-**What adaptive tuning still cannot do.** PSI and Senpai fail in two specific ways relevant to this project:
-
-- **PSI fires for the right symptom but triggers the wrong fix.** When B evicts A's pages and A faults them back in, A's `memory.pressure` and `io.pressure` both rise. Senpai responds by resizing memory limits. But if B's dirty page flushes are still in the I/O queue, A's reads remain delayed even after memory limits are corrected. The fix is incomplete because it does not address I/O queue contention.
-- **PSI cannot attribute I/O queue delay to its source cgroup.** A's `io.pressure` rises whether its reads are delayed by its own workload or by B's dirty writes queued ahead. There is no kernel mechanism to say "X% of A's io.pressure is attributable to B's writeback." ⚠️ *Needs validation: measure A's p99 under (a) B clean-reads only, (b) B dirty-writes only — to quantify how much the dirty component adds beyond what memory resizing fixes.*
-
----
-
-## Novelty
-
-**The gap:** Delta Fair Sharing identifies OS page cache interference as an open problem — they do not implement a solution. Existing tools (cgroup limits, PSI/Senpai) can reduce how much B evicts A but cannot bound p99 because they miss the second interference component: B's dirty-page flushes inflating A's per-miss I/O penalty.
-
-**Two-component model of p99 latency spike:**
+The benchmark exists to validate the two-component model of the p99 spike
 
 ```
-A's p99 spike = A's cache miss rate x per-miss disk read latency
-                              where per-miss latency = baseline_read + writeback_queue_delay(B)
+A's p99 spike = (A's cache-miss rate) × (baseline_read + writeback_queue_delay(B))
 ```
 
-Memory sizing tools (Senpai, cgroup limits) address only the first factor. They cannot reduce `writeback_queue_delay(B)` — that is an I/O scheduler problem, not a memory sizing problem.
+The experiments isolate the **two interference mechanisms**:
 
-**Why prior work misses the second factor:**
-| System | What it controls | What it cannot address |
+- **Mechanism 1 — eviction only:** B runs a large *clean* sequential scan, fills
+  the LRU, and evicts A's hot pages. A re-faults them from disk. No writeback.
+- **Mechanism 2 — eviction + dirty writeback:** B runs *buffered writes*, so it
+  both evicts A's pages **and** generates dirty pages whose flushes land in the
+  I/O queue ahead of A's reads, inflating A's per-miss latency.
+
+The headline result compares A's p99 under Mechanism 1 vs Mechanism 2 **at the
+same eviction rate** — if the writer case is worse, that confirms dirty
+writeback amplifies the miss penalty beyond what memory sizing alone can fix.
+
+> The old framing ("small sequential workloads win, large random workloads lose")
+> is a side effect, not the object of study. Workloads below are organized around
+> **victim + noisy-neighbor pairings**, not around a single-workload sweep.
+
+## 📁 Project Structure
+
+```
+pagecachefairnessbenchmark/
+├── fairness_configs.ini           # Workload definitions (victim + B variants)
+├── cgroup_shared.ini              # Shared-cache cgroup layout (2G pool)
+├── cgroup_isolated.ini            # Isolated / memory.low cgroup layout
+├── benchmark.c                    # C benchmark implementation
+├── benchmark                      # Compiled C binary
+├── Makefile                       # Build configuration
+├── benchmark_analysis.py          # Results analysis (fio + PSI + refaults)
+├── benchmark_results/             # Test results directory
+│   ├── *.json                     # Raw fio output (per phase)
+│   ├── iostat/                    # iostat -x logs
+│   ├── psi/                       # Per-cgroup PSI time series (CSV)
+│   └── memstat/                   # Per-cgroup memory.stat snapshots (CSV)
+├── test_file_*                    # Generated test files (size-tagged)
+└── README.md                      # Research thesis and experiment plan
+```
+
+## Gettings Started
+
+### Prerequisites
+- `fio` (I/O benchmark tool)
+- `gcc` with C11 support
+- `make` (build tool)
+- `iostat` (I/O monitoring)
+- Sufficient disk space for test files (17+ GB)
+
+### Install Dependencies (macOS)
+```bash
+brew install fio gcc make
+```
+
+### Install Dependencies (Ubuntu/Debian)
+```bash
+sudo apt-get install fio gcc make sysstat
+```
+
+### Build the Benchmark
+```bash
+make
+```
+
+## 📊 Workload Design
+
+Workloads are grouped by the **role** they play in an experiment, not by a
+read/write × iodepth grid. Sizes are expressed **relative to the cgroup memory
+cap** (`memory.max`, 2G in `cgroup_shared.ini`) rather than as fixed absolutes,
+because interference depends on working-set-to-cache ratio.
+
+### Tenant A — the victim (what we measure)
+
+| Workload | Working set | Pattern | Distribution | Concurrency | Mode | Rationale |
+|---|---|---|---|---|---|---|
+| `victim_randread_hot` | 0.5× cap (fits) | randread, 4k | `zipf:1.2` | numjobs=4, iodepth=1, **rate-limited** | cached | Latency-sensitive reader whose hot set fits in cache; report clat **p99**. Rate limit keeps p99 an SLO signal, not a saturation artifact. |
+
+### Tenant B — the noisy neighbor (isolates the mechanisms)
+
+| Workload | File | Pattern | bs | Mode | Mechanism |
+|---|---|---|---|---|---|
+| `b_scan_clean` | 4× cap | read (sequential) | **1M** | cached | **1** — LRU pollution / eviction, no writeback |
+| `b_randwrite_dirty` | 4× cap | randwrite | 4k | **cached (buffered)** | **2** — eviction **+** dirty writeback contention |
+| `b_mixed` | 4× cap | randrw (`rwmixread=50`) | 4k | cached | **1 + 2** combined |
+| `b_checkpoint` | 2× cap | write + `fdatasync=1000` | 1M | cached | Periodic flush **bursts** (PostgreSQL checkpoint / etcd commit) |
+| `b_wal_append` | 2× cap | write (sequential) + `fdatasync=32` | 4k | cached | Append-only log dirtying (bbolt/etcd WAL) |
+
+### Baselines (required to compute the interference delta)
+
+| Workload | Setup | Purpose |
 |---|---|---|
-| `memory.low` / `memory.min` | Total page allocation per cgroup | Per-miss I/O latency inflation from concurrent writeback |
-| PSI / Senpai | Memory reclaim throttling via stall feedback | I/O queue contention attribution; no per-cgroup dirty-page rate limit |
-| Delta Fair Sharing | RocksDB-layer write buffer + block cache fairness | OS page cache path; dirty page flush scheduling at block layer |
-| LRU / cache_ext policies | Eviction ordering by recency | Dirty/clean status not an eviction criterion; no I/O layer coordination |
+| `victim_alone` | A only, no B | Flat-p99 reference; interference = (A+B) − this |
+| `b_*_alone` | each B only | Confirm B is not self-throttled |
+
+## 🔬 Experiment Structure
+
+The unit of experiment is a **dual-client pairing** (`dual` mode), run under the
+four isolation conditions from the thesis:
+
+| Condition | Setup | Expected outcome |
+|---|---|---|
+| Baseline | A alone (`victim_alone`) | p99 flat; cache-hit ≈ 100% |
+| Interference | A + B, no isolation | A's p99 spikes; writer B worse than reader B at equal eviction |
+| cgroup v2 | A's `memory.low` = WS, no hard cap on B (`cgroup_isolated.ini`) | Partial recovery; residual p99 elevation under writer B |
+| Proposed policy | A + B under proposed policy | A's p99 within SLO for both B variants |
+
+**Key comparison:** `victim + b_scan_clean` vs `victim + b_randwrite_dirty` at the
+**same eviction rate** → does dirty writeback add p99 beyond clean eviction?
+
+**Intensity sweep (Fig 1):** run `b_scan_clean` and `b_randwrite_dirty` across a
+range of `phase_*_rate_iops` (e.g. 1k / 5k / 20k / 50k / unlimited) to plot
+B's intensity (X) vs A's p99 (Y), one curve per mechanism.
+
+### Axes that matter (and ones that don't)
+
+- **Block size** is a first-class variable: `bs=1M` sequential = clean scan;
+  `bs=4k` random = dirty writes. Do **not** fix everything at 4k.
+- **Access distribution** matters: uniform random over a huge file never reuses
+  pages, so eviction is free. Use `zipf` for the victim so refaults actually hurt.
+- **Buffered vs direct:** writer B must run in **cached** mode — `direct=1`
+  generates no dirty page cache and disables Mechanism 2.
+- **`numjobs` over `iodepth`** for concurrency: buffered I/O degrades toward
+  synchronous, so `iodepth` barely varies true concurrency in cached mode.
+  Reserve `iodepth` for the `direct` no-cache baseline.
+
+## 🧪 Experiment Cases (change one variable at a time)
+
+These cases form a **controlled progression**: hold the two tenants
+(`client1_steady`, `client2_noisy`), their patterns, runtime, and block size
+fixed, and change **exactly one knob per step** so any change in A's p99 or
+refault delta is attributable to that knob. Each case is a delta from the one
+before it.
+
+| Case | Name | Concurrency | cgroup / memory config | The single variable changed | What it isolates |
+|---|---|---|---|---|---|
+| 1 | Isolated Baselines | Each client **alone** | n/a (no sharing) | — (reference point) | Standalone p99 / throughput per client; the baseline all deltas subtract from |
+| 2 | Isolated Clients | Concurrent | `cgroup_isolated.ini` (each client its own memory floor) | +concurrency, **with** isolation | Whether isolation keeps p99 ≈ baseline when both run together |
+| 3 | Shared Sequential | Concurrent | **no memory limits** (`--no-cgroup`) | remove cgroup memory limits (shared pool) | Raw interference with nothing protecting A |
+| 4 | Shared Client 2 Random Read | Concurrent | shared, parent `memory.max = 512M` | B → 48G file, `randread`, under tiny shared cap | Heavy eviction pressure: B's working set ≫ cache |
+| 5 | Shared Client 1 Limited | Concurrent | shared, `client1_steady memory.max = 1G` | cap the **victim's** memory | Whether limiting A (not B) helps or hurts A's p99 |
+| 6 | Shared Client 2 Limited | Concurrent | shared, `client2_noisy memory.max = 1G` | cap the **aggressor's** memory | The standard mitigation: does capping B bound A's p99? |
+
+**How to read the progression:**
+- **1 → 2:** adds concurrency but keeps isolation → expect A's p99 stays near baseline.
+- **2 → 3:** removes the memory limits → expect A's p99 to spike (interference).
+- **3 → 4:** makes B a cache-thrashing random reader under a 512M cap → expect
+  maximal eviction of A and large `workingset_refault_file_delta` for A.
+- **3 → 5** and **3 → 6:** each caps exactly one tenant → compares "limit the
+  victim" vs "limit the noisy neighbor" as isolation strategies.
+
+### Running each case
+
+```bash
+# Case 1 — Isolated Baselines (run each client on its own, no contention)
+./benchmark client1_steady
+./benchmark client2_noisy
+
+# Case 2 — Isolated Clients (concurrent, isolated cgroups)
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached dual
+
+# Case 3 — Shared Sequential (concurrent, no memory limits)
+sudo ./benchmark --no-cgroup -m cached dual
+
+# Cases 4–6 — Shared with one cap changed (edit the cgroup .ini, then run)
+sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+```
+
+For Cases 4–6, change the single `memory.max` line in the cgroup config (keep
+everything else identical to Case 3's shared layout):
+
+```ini
+# Case 4 — parent (shared) cap = 512M, and set client2_noisy file_size = 48G
+[clients]
+cgroup_name = clients
+memory.max = 512M
+
+# Case 5 — cap only the victim
+[client1_steady]
+memory.max = 1G
+
+# Case 6 — cap only the aggressor
+[client2_noisy]
+memory.max = 1G
+```
+
+> **Strict one-at-a-time note:** Case 4 changes *two* knobs (B's `file_size` →
+> 48G **and** the shared cap → 512M). If you want each step to isolate a single
+> variable, split it into 4a (file size only) and 4b (add the 512M cap), and run
+> them in sequence. Record which knob moved in each run so the p99 / refault
+> delta is unambiguously attributable.
+
+Use `-o <dir>` to send each case to its own results directory (e.g.
+`-o results/case3_shared`) so `benchmark_analysis.py` can compare them
+side by side.
+
+## 🔧 Usage
+
+### Run a Dual-Client Interference Experiment (primary mode)
+
+`dual` mode runs `client1_steady` (Tenant A) and `client2_noisy` (Tenant B)
+concurrently under cgroups — this is the experiment that produces the p99 result.
+
+```bash
+# Run the A + B pairing in BOTH cached and direct modes
+./benchmark dual
+
+# Writer-B interference must run in CACHED mode (direct=1 disables Mechanism 2)
+./benchmark -m cached dual
+
+# With a specific cgroup layout
+./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+```
+
+### Run a Single Workload (characterization / baselines)
+
+```bash
+# Baseline: victim alone
+./benchmark -v victim_alone
+
+# Characterize one noisy-neighbor variant on its own
+./benchmark b_randwrite_dirty
+```
+
+### Run Everything
+
+```bash
+./benchmark all        # every workload defined in the config
+./benchmark -v all     # verbose
+```
+
+### Analyze Results
+```bash
+# Analyze fairness results
+./benchmark_analysis.py benchmark_results/
+```
+
+## 📈 Understanding Results
+
+### What to look for
+
+The primary signal is **Tenant A's p99 read latency**, compared across
+conditions and across B variants:
+
+- **A alone** → p99 flat, near cache-hit latency.
+- **A + `b_scan_clean`** → p99 rises from eviction/re-faults (Mechanism 1).
+- **A + `b_randwrite_dirty`** → p99 rises **further** at the same eviction rate,
+  the extra delta attributable to writeback queue contention (Mechanism 2).
+- **A + B under cgroup `memory.low`** → partial recovery for the reader B case;
+  **residual** elevation for the writer B case = the "existing tools insufficient"
+  result.
+
+### Working-set refault deltas (page-cache eviction churn)
+
+`benchmark_analysis.py` now reports per-phase `workingset_refault_file_delta`
+per cgroup, read from `memstat/`. This counts file-backed pages a tenant evicted
+and had to re-fault from disk during a phase — a direct measure of how much one
+tenant's activity churns another's cache.
+
+```
+## 🔁 WORKING SET REFAULTS (page-cache eviction churn)
+==================================================
+### CACHED mode
+
+**client1_steady:**
+  phase 2:          300 pages (     1.2 MiB)
+
+**client2_noisy:**
+  phase 2:       25,000 pages (    97.7 MiB)
+
+  Refault comparison (client1_steady vs client2_noisy):
+    phase 2: client1_steady=300  client2_noisy=25,000  → client2_noisy refaulted 83.3× more
+```
+
+## 🔍 Key Metrics
+
+- **p99 / p999 read latency (μs)** — the objective; from fio `clat_ns.percentile`.
+  *Lower and flatter under interference = better isolation.*
+- **`workingset_refault_file_delta`** — pages re-faulted per phase per cgroup
+  (page-cache eviction churn); from `memstat/` (× 4 KiB ≈ bytes re-read).
+- **PSI (`some`/`full`, memory + io)** — per-cgroup stall time; from `psi/`.
+- **iostat read vs. write latency & queue depth** — surfaces writeback contention.
+- **IOPS / BW** — secondary throughput context, not the objective.
+- *(Planned, TODO in `README.md`)* `/proc/vmstat` `nr_dirty` / `nr_writeback`
+  and per-cgroup `file_dirty` at 1s intervals.
+
+## ⚙️ Configuration
+
+Edit `fairness_configs.ini` to modify per-phase parameters:
+- `runtime` (seconds), `block_size`, `numjobs`, `iodepth`, `rate_iops`
+- `pattern` — `randread` (victim), `read` (clean scan), `randwrite` / `write`
+  (dirty B), `randrw` (mixed)
+- `file_size` — choose **relative to `memory.max`** (e.g. 0.5× cap for the
+  victim's hot set, 2–4× cap for B), not a fixed absolute
+
+Multi-phase configuration format (phase-prefixed keys):
+```ini
+[client1_steady]                 ; Tenant A — the victim
+description = Hot-set random reader; measure p99
+file_size = 1G
+phase_0_pattern = randread
+phase_0_block_size = 4k
+phase_0_rate_iops = 5000
+phase_0_iodepth = 1
+phase_0_numjobs = 4
+phase_0_runtime = 60
+phase_0_ioengine = libaio
+
+[client2_noisy]                 ; Tenant B — buffered dirty writer (Mechanism 2)
+description = Random writer generating dirty writeback
+file_size = 8G
+phase_0_pattern = randwrite
+phase_0_block_size = 4k
+phase_0_rate_iops = 20000
+phase_0_iodepth = 32
+phase_0_numjobs = 4
+phase_0_runtime = 60
+phase_0_ioengine = libaio
+```
+
+> **Reminder:** run writer-B pairings with `-m cached`. In `direct` mode fio
+> bypasses the page cache, so B produces no dirty pages and Mechanism 2 vanishes.
+
+**Planned fields (not yet parsed — see TODO in `README.md`):**
+`phase_N_random_distribution` (e.g. `zipf:1.2`) for the victim's hot set, and
+`phase_N_fdatasync` / `phase_N_fsync` (flush cadence) for the checkpoint/WAL
+B variants. These require adding fields to `PhaseConfig` and the fio command
+builders in `benchmark.c`.
+
+## 📋 Test Results
+
+Results are saved under `benchmark_results/`:
+- **JSON**: `*.json` — raw fio output per phase (includes `clat_ns.percentile.99`)
+- **Summary**: `summary.txt` — run summary
+- **iostat**: `iostat/*.iostat` — device read/write latency & queue depth
+- **PSI**: `psi/*.csv` — per-cgroup memory + io pressure time series
+- **memstat**: `memstat/<client>_<mode>.csv` — per-cgroup `memory.stat` snapshots
+  (`before`/`after` each phase) plus the `workingset_refault_file_delta` rows
+
+## 🛠 Troubleshooting
+
+### Permission Issues
+```bash
+# sudo is required for cache clearing (drop_caches) and cgroup setup
+sudo ./benchmark -m cached dual
+```
+
+### Disk Space
+```bash
+# B files are sized relative to the cache cap (2–4× memory.max).
+# Ensure room for the largest test file plus the victim's file.
+df -h .
+```
+
+### Dependencies
+```bash
+# Check if tools are installed
+which fio gcc make iostat
+
+# Build the benchmark
+make
+```
+
+## 📊 Example Complete Workflow
+
+```bash
+# 1. Build the benchmark
+make
+
+# 2. Run the A + B interference experiment in cached mode
+sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+
+# 3. Analyze results (fio p99 + PSI + refault deltas)
+./benchmark_analysis.py benchmark_results/
+
+# 4. View summary
+cat benchmark_results/summary.txt
+```
+
+## 🎯 What This Benchmark Aims to Show
+
+1. A latency-sensitive reader's **p99 spikes** when it shares the page cache
+   with a noisy neighbor — even at equal `io.weight` / `cpu.weight`.
+2. A **buffered writer** neighbor inflates that p99 **more** than a clean
+   scanner at the same eviction rate — the dirty-writeback component.
+3. Standard cgroup memory isolation (`memory.low`) **partially** recovers the
+   reader-neighbor case but leaves **residual** p99 elevation for the writer
+   case — motivating cross-layer (memory ↔ I/O) coordination.
+
+## 🏗️ Build and Development
+
+### Building from Source
+```bash
+# Clone the repository
+git clone <repository-url>
+cd pagecache
+
+# Install dependencies (see prerequisites above)
+brew install fio gcc make  # macOS
+# OR
+sudo apt-get install fio gcc make sysstat # Linux
+
+# Build the benchmark
+make
+
+# Clean build artifacts
+make clean
+```
+
+### Available Make Targets
+- `make` or `make all`: Build the benchmark
+- `make clean`: Remove build artifacts
+- `make test`: Run a single workload test
+- `make benchmark`: Run all benchmarks
+- `make analyze`: Analyze existing results
+- `make workflow`: Complete build, test, analyze workflow
+
+## 🔧 Advanced Usage
+
+### Custom Configuration
+Create or modify `fairness_configs.ini`. For dual-client experiments the two
+sections must be named `client1_steady` (Tenant A) and `client2_noisy`
+(Tenant B); use phase-prefixed keys for multi-phase runs:
+```ini
+[client2_noisy]
+description = Custom B: mixed random read/write neighbor
+file_size = 8G                    ; ~4× the 2G cgroup cap
+phase_0_pattern = randrw
+phase_0_block_size = 4k
+phase_0_rate_iops = 20000
+phase_0_numjobs = 4
+phase_0_iodepth = 32
+phase_0_runtime = 120
+phase_0_ioengine = libaio
+```
+
+> **Platform note:** cgroups, PSI, and `memory.stat` require **Linux (cgroup v2)**.
+> The dual-client interference experiments must run on a Linux host; macOS is
+> only useful for building/iterating on the code.
+
+### Command Line Options
+```bash
+./benchmark --help      # Show help
+./benchmark -v all      # Verbose mode
+./benchmark -c custom.ini -o results/ workload_name
+```
 
 ## Repository Status
 
-The benchmark infrastructure in this repo has the basic skeleton. See the TODO list below for what needs to change before experiments can produce the key results.
+The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Experiments are driven by `./benchmark`; operational details and Cases 1–6.
 
+### Layout
 
----
+| Path | Role |
+|------|------|
+| `benchmark.c` | Harness: INI parsing, cgroup setup, fio orchestration, telemetry sampler |
+| `Makefile` | `make` → `./benchmark` (`gcc -std=c11`) |
+| `fairness_configs.ini` | Workload definitions (victim, noisy neighbor, B variants) |
+| `cgroup_isolated.ini` | Per-tenant cgroups; `memory.low` on victim |
+| `cgroup_shared.ini` | Shared 2G parent pool; nested tenant cgroups |
+| `benchmark_analysis.py` | Summarize fio p99, refault deltas, dirty/vmstat peaks, PSI |
+| `benchmark_results/` | Default output directory (`-o` overrides) |
 
-### Phase 0 — Scaffold
+### Harness
 
-- [ ] Create `pagecache_bench/` with Makefile (`gcc -std=c11`), `src/*.c` layout, stub INI files, default `fairness_results/`
-- [ ] **`config.c/h`** — INI parser for `PhaseConfig`: `runtime`, `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `ioengine`, **`random_distribution`** (e.g. `zipf:1.2`), **`fdatasync`** / **`fsync`**
-- [ ] **`util.c/h` + `process.c/h`** — logging, timestamps, `run_system()`, fork/exec/wait, signal cleanup
-- [ ] **`main.c` CLI** — `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `-v`; modes: `dual`, `single <workload>`, `all`
+- **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `-v`
+- **Modes:** `dual` (`client1_steady` + `client2_noisy`), single workload name, `all`
+- **Cache:** `drop_caches()` before each cached phase; fio `direct=0` (cached) or `direct=1` (bypass)
+- **Test files:** pre-created with `fio --create_only` (`test_file_<client>_<size>`)
+- **Concurrency:** all clients in a phase forked together; phases run sequentially
+- **fio output:** one JSON per client per phase (`*_pN.json`) with `clat_ns.percentile` (p99/p999)
 
----
+### cgroups
 
-### Phase 1 — Single-client baseline
+- Create cgroup tree under `/sys/fs/cgroup`, enable `memory` + `io` controllers
+- Apply `memory.max`, `memory.low`, `io.weight` from cgroup INI
+- Attach fio via `cgroup.procs` before exec
+- Per-phase `memory.stat` snapshots (`workingset_refault_file` before/after → delta in `memstat/`)
 
-- [ ] **`cache.c/h`** — `drop_caches()`, `create_test_file()` via `fio --create_only`; check deps (`fio`, `iostat`)
-- [ ] **`workload.c/h`** — `build_fio_cmd()`, `run_phases()`, `parse_fio_p99()`; wire zipf + fdatasync into fio CLI
-- [ ] **`victim_alone`** — run `victim_randread_hot` alone; one JSON per phase + `summary.txt`
-- [ ] **Validate:** flat p99 after warmup; `workingset_refault_file` ≈ 0
+### Telemetry (1 Hz during each mode run)
 
----
+- **iostat:** `iostat -dx 1` → `iostat/run_<mode>.iostat`
+- **PSI:** per-cgroup `memory.pressure` + `io.pressure` → `psi/<cgroup>_<mode>.csv`
+- **vmstat:** `nr_dirty`, `nr_writeback`, `pgpgin`, `pgscan_kswapd` → `dirty/vmstat_<mode>.csv`
+- **Per-cgroup dirty:** `file_dirty`, `file_writeback` → `dirty/<cgroup>_<mode>_dirty.csv`
 
-### Phase 2 — Dual-client + cgroups
+Requires `--cgroup-config` for per-tenant memstat/PSI/dirty (not recorded with `--no-cgroup`).
 
-- [ ] **`cgroup.c/h`** — create/apply/attach/teardown; read `memory.stat`; port from `cgroup_pressure_benchmark.c`
-- [ ] **`cgroup_isolated.ini`** — `memory.low = WS` for victim; **no hard cap on B**
-- [ ] **`cgroup_shared.ini`** — 2G parent pool (file sizes: 0.5× cap victim, 4× cap B)
-- [ ] **`dual` mode** — fork victim + B, attach cgroups, multi-phase fio; **one JSON per phase** (no last-phase-only merge)
-- [ ] **Validate:** A + `b_scan_clean` → A p99 spikes; refault delta rises
+### Workloads (`fairness_configs.ini`)
 
----
+| Section | Role |
+|---------|------|
+| `client1_steady` | Tenant A — rate-limited hot-set `randread` (victim in `dual`) |
+| `client2_noisy` | Tenant B — default buffered `randwrite` (noisy neighbor in `dual`) |
+| `victim_alone` | A alone baseline |
+| `b_scan_clean` | Mechanism 1 — sequential clean read |
+| `b_randwrite_dirty` | Mechanism 2 — buffered random writer |
+| `b_mixed` | Mixed `randrw` |
+| `b_checkpoint` | Sequential write + `fdatasync=1000` |
+| `b_wal_append` | Sequential write + `fdatasync=32` |
 
-### Phase 3 — Workloads + telemetry
+Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime`, `ioengine`, `rwmixread`, `random_distribution` (e.g. `zipf:1.2`), `fdatasync`, `fsync`. For `dual`, copy a B variant's `phase_0_*` into `[client2_noisy]`.
 
-- [ ] **`fairness_configs.ini`** sections:
-  - `victim_randread_hot`, `victim_alone`
-  - `b_scan_clean`, `b_randwrite_dirty`, `b_mixed`, `b_checkpoint`, `b_wal_append`
-  - `b_*_alone` (each B variant without victim)
-- [ ] **`monitor.c/h`** — 1 Hz: PSI (system + per-cgroup), `memory.stat` before/after each phase, `iostat -dx 1`
-- [ ] **`/proc/vmstat` poller** — `pgpgin`, `nr_dirty`, `nr_writeback`, `pgscan_kswapd` (see Key Metrics above)
-- [ ] **Validate:** A + `b_randwrite_dirty` (cached) → A p99 **above** scan B at matched eviction; `nr_writeback` correlates
+### Quick start
 
----
-
-### Phase 4 — Experiment matrix
-
-- [ ] **Cases 1–6** (one knob at a time; `-o results/caseN/` each):
-  - Case 1: isolated baselines (each client alone)
-  - Case 2: concurrent + `cgroup_isolated.ini`
-  - Case 3: concurrent + `--no-cgroup`
-  - Case 4: shared 512M cap + 48G randread B (split 4a/4b for strict single-variable)
-  - Case 5: cap victim only (`client1 memory.max = 1G`)
-  - Case 6: cap aggressor only (`client2 memory.max = 1G`)
-- [ ] **Four isolation conditions:**
-  - Baseline → `victim_alone`
-  - Interference → `--no-cgroup dual`
-  - cgroup v2 → `cgroup_isolated.ini dual`
-  - Proposed → placeholder
-- [ ] **Headline compare:** `b_scan_clean` vs `b_randwrite_dirty` at **same eviction rate**
-- [ ] **Validate:** `memory.low` partially recovers scan B; writer B leaves residual p99 tail
-
----
-
-### Phase 5 — Sweeps + analysis
-
-- [ ] **`scripts/run_sweep.sh`** — sweep B `rate_iops` (1k / 5k / 20k / 50k / unlimited) for scan vs write → Fig 1 CSV
-- [ ] **Extend `quick_fairness_analysis.py`** — all phases preserved, SLO violation rate (>2× baseline p99), side-by-side case dirs, vmstat/`file_dirty` if logged
-
----
-
-### Phase 6 — Tests + docs
-
-- [ ] **`tests/test_config_parse.c`** — INI parsing unit test
-- [ ] **`tests/test_cgroup_roundtrip.sh`** — create → set `memory.low` → attach → read → destroy
-- [ ] Update this file: C build (`gcc` not `g++`), new binary name `pagecache_bench`
-
----
-
-### Build-order checklist (learning path)
-
-| Step | Milestone | Pass criteria |
-|------|-----------|---------------|
-| 1 | `victim_alone` | Flat p99; refault ≈ 0 after warmup |
-| 2 | `dual` + `b_scan_clean` | A p99 spikes; refault delta rises |
-| 3 | `dual` + `b_randwrite_dirty` | A p99 > scan at same eviction; `nr_writeback` up |
-| 4 | `cgroup_isolated.ini` | Scan largely recovers; writer residual tail |
-| 5 | Cases 1–6 + sweep | Full workflow; Fig 1 curves diverge |
+```bash
+make
+sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+./benchmark_analysis.py benchmark_results/
+```
