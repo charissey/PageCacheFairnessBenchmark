@@ -31,11 +31,11 @@ A's p99 spike = (A's cache-miss rate) × (baseline_read + writeback_queue_delay(
                 └─────── Mechanism 1 ───────┘   └────────── Mechanism 2 ──────────┘
 ```
 
-- **Mechanism 1 — eviction only.** B runs a large **clean** sequential scan
-  (`b_scan_clean`), fills the LRU, evicts A's hot pages; A re-faults them from
-  disk. No writeback involved.
-- **Mechanism 2 — eviction + dirty writeback.** B runs **buffered writes**
-  (`b_randwrite_dirty`); it evicts A's pages **and** produces dirty pages whose
+- **Mechanism 1 — eviction only.** Set `[client2_noisy]` to a large **clean read**
+  (`read` sequential or `randread`); B fills the LRU, evicts A's hot pages; A
+  re-faults from disk. No writeback involved.
+- **Mechanism 2 — eviction + dirty writeback.** Set `[client2_noisy]` to
+  **buffered `randwrite`**; B evicts A's pages **and** produces dirty pages whose
   flushes land in the I/O queue ahead of A's read misses, inflating each miss.
 
 **Headline comparison:** A's p99 under Mechanism 1 vs Mechanism 2 *at the same
@@ -49,7 +49,7 @@ penalty beyond what memory sizing alone can fix — the core result.
 | File | Role |
 |---|---|
 | `benchmark.c` | The whole harness: config parsing, fio command building, cgroup setup, run orchestration, telemetry sampling. |
-| `fairness_configs.ini` | Workload definitions: victim + every B variant + baselines. |
+| `fairness_configs.ini` | Workload definitions: `client1_steady` + `client2_noisy` only. |
 | `cgroup_shared.ini` | Shared-pool cgroup layout (2G parent cap; both tenants under it). |
 | `cgroup_isolated.ini` | Isolated layout (`memory.low` floor for the victim, no hard cap on B). |
 | `Makefile` | Build + convenience run targets. |
@@ -112,10 +112,9 @@ end. Search `benchmark.c` for the tags:
   `--random_distribution=zipf:1.2`. Skews the victim's hot set so refaults
   actually hurt (uniform-random over a huge file never reuses pages, making
   eviction "free" and hiding the effect).
-- **`[TODO-2]` `phase_N_fdatasync` / `phase_N_fsync`** — flush cadence. Emitted
-  as `--fdatasync=N` / `--fsync=N`. `b_checkpoint` uses `fdatasync=1000`
-  (periodic big flush bursts, PostgreSQL/etcd style); `b_wal_append` uses
-  `fdatasync=32` (frequent small flushes, WAL style).
+- **`[TODO-2]` `phase_N_fdatasync` / `phase_N_fsync`** — flush cadence on
+  `[client2_noisy]`. Emitted as `--fdatasync=N` / `--fsync=N` (e.g. checkpoint
+  or WAL-style periodic flushes).
 - **`[TODO-3]` `/proc/vmstat` + per-cgroup `file_dirty` sampling** — the 1 Hz
   sampler above. Directly measures dirty-page accumulation and writeback, the
   observable signature of Mechanism 2.
@@ -203,13 +202,12 @@ Each step changes **one** variable from the previous, so any change in A's p99
 or refault delta is attributable to that knob. Send each to its own results dir
 with `-o` so the analysis script can compare them side by side.
 
-### Step 0 — Baseline: victim alone
+### Step 0 — Baseline: A alone (optional; same as Case 1a)
 
 ```bash
-sudo ./benchmark -m cached -o results/baseline victim_alone
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1a client1_steady
 ```
-*Expect:* flat p99, `workingset_refault_file_delta ≈ 0`. This is the reference
-every later delta subtracts from.
+*Expect:* flat p99, `workingset_refault_file_delta ≈ 0`. Reference for Δp99.
 
 ### Step 1 — Isolated baselines (each client alone)
 
@@ -265,28 +263,27 @@ sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/case6 du
 ```
 *Isolates:* whether capping **B** bounds A's p99.
 
-### Step 7 — The headline: Mechanism 1 vs Mechanism 2 at equal eviction
+### Step 7 — Mechanism 1 vs Mechanism 2 at equal eviction
 
-Run the victim against a clean scanner, then against a buffered writer, matching
-their eviction rate (tune `phase_0_rate_iops`):
+Edit `[client2_noisy]` for read vs write B (match `phase_0_rate_iops`), then:
 
 ```bash
-# Point client2_noisy at b_scan_clean's params, or run the pairing directly:
-sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/scan  dual   # B = clean scan
-# then swap client2_noisy to the b_randwrite_dirty params and:
-sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/write dual   # B = dirty writer
+# B = randread (or sequential read) — Mechanism 1
+sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/scan dual
+
+# B = randwrite — Mechanism 2
+sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/write dual
 
 ./benchmark_analysis.py results/scan
 ./benchmark_analysis.py results/write
 ```
-*Expect:* at the same eviction rate, `results/write` shows **higher** A p99 and
-elevated `nr_writeback` — the dirty-writeback amplification.
+*Expect:* at the same rate, `results/write` shows **higher** A p99 and elevated
+`nr_writeback` — dirty-writeback amplification.
 
 ### Intensity sweep (Fig 1)
 
-Run `b_scan_clean` and `b_randwrite_dirty` across `rate_iops` = 1k / 5k / 20k /
-50k / unlimited, one results dir each, and plot B's intensity (X) vs A's p99 (Y),
-one curve per mechanism.
+Sweep `client2_noisy` `phase_0_rate_iops` (1k / 5k / 20k / 50k / unlimited) for
+read vs write B; plot B intensity (X) vs A p99 (Y).
 
 ---
 
@@ -342,10 +339,8 @@ phase_0_runtime = 60
 phase_0_ioengine = libaio
 ```
 
-**B variants also defined** (swap into `client2_noisy` or run standalone):
-`b_scan_clean` (Mech 1, 1M sequential read), `b_randwrite_dirty` (Mech 2),
-`b_mixed` (`randrw`, `rwmixread=50`), `b_checkpoint` (`fdatasync=1000`),
-`b_wal_append` (`fdatasync=32`).
+Edit `phase_0_pattern`, `phase_0_block_size`, and related keys on `[client2_noisy]`
+for Mechanism 1 (`read` / `randread`) vs Mechanism 2 (`randwrite`).
 
 **Recognized phase keys:** `pattern`, `block_size`, `ioengine`, `rate_iops`,
 `iodepth`, `numjobs`, `runtime`, `rwmixread`, `random_distribution`,
@@ -366,12 +361,12 @@ phase_0_ioengine = libaio
   total), in ms.
 
 **What the thesis predicts you'll see:**
-1. A alone → flat p99, ~100% cache hit.
-2. A + `b_scan_clean` → p99 rises from refaults (Mechanism 1).
-3. A + `b_randwrite_dirty` → p99 rises **further** at the same eviction rate
+1. `client1_steady` alone → flat p99, ~100% cache hit.
+2. A + B (`randread` / sequential read) → p99 rises from refaults (Mechanism 1).
+3. A + B (`randwrite`) → p99 rises **further** at the same eviction rate
    (Mechanism 2), with elevated `nr_writeback`.
-4. A + B under `memory.low` → partial recovery for the scanner; **residual**
-   p99 elevation for the writer — motivating cross-layer memory↔I/O coordination.
+4. A + B under `memory.low` → partial recovery for read B; **residual** p99
+   elevation for write B — motivating cross-layer memory↔I/O coordination.
 
 ---
 

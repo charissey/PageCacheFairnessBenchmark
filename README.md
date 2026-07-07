@@ -82,26 +82,24 @@ because interference depends on working-set-to-cache ratio.
 
 ### Tenant A — the victim (what we measure)
 
-| Workload | Working set | Pattern | Distribution | Concurrency | Mode | Rationale |
-|---|---|---|---|---|---|---|
-| `victim_randread_hot` | 0.5× cap (fits) | randread, 4k | `zipf:1.2` | numjobs=4, iodepth=1, **rate-limited** | cached | Latency-sensitive reader whose hot set fits in cache; report clat **p99**. Rate limit keeps p99 an SLO signal, not a saturation artifact. |
+`client1_steady`: 1G `randread`, 4k, rate-limited (`rate_iops=5000`, `numjobs=4`), cached mode. Report clat **p99**. Optional `phase_0_random_distribution = zipf:1.2` skews the hot set so refaults hurt.
 
-### Tenant B — the noisy neighbor (isolates the mechanisms)
+### Tenant B — the noisy neighbor
 
-| Workload | File | Pattern | bs | Mode | Mechanism |
-|---|---|---|---|---|---|
-| `b_scan_clean` | 4× cap | read (sequential) | **1M** | cached | **1** — LRU pollution / eviction, no writeback |
-| `b_randwrite_dirty` | 4× cap | randwrite | 4k | **cached (buffered)** | **2** — eviction **+** dirty writeback contention |
-| `b_mixed` | 4× cap | randrw (`rwmixread=50`) | 4k | cached | **1 + 2** combined |
-| `b_checkpoint` | 2× cap | write + `fdatasync=1000` | 1M | cached | Periodic flush **bursts** (PostgreSQL checkpoint / etcd commit) |
-| `b_wal_append` | 2× cap | write (sequential) + `fdatasync=32` | 4k | cached | Append-only log dirtying (bbolt/etcd WAL) |
+`client2_noisy`: default **Mechanism 2** — 8G `randwrite`, 4k, buffered (`rate_iops=20000`, `numjobs=4`, `iodepth=32`). Edit `phase_0_*` in `[client2_noisy]` for other B behaviors:
 
-### Baselines (required to compute the interference delta)
+| Pattern | bs | Mechanism |
+|---------|-----|-----------|
+| `read` (sequential) | 1M | **1** — LRU pollution, no writeback |
+| `randread` | 4k | **1** — random read pressure |
+| `randwrite` | 4k | **2** — eviction + dirty writeback |
 
-| Workload | Setup | Purpose |
-|---|---|---|
-| `victim_alone` | A only, no B | Flat-p99 reference; interference = (A+B) − this |
-| `b_*_alone` | each B only | Confirm B is not self-throttled |
+### Baselines (Case 1)
+
+| Run | Command | Purpose |
+|-----|---------|---------|
+| A alone | `./benchmark client1_steady` | Flat-p99 reference; Δp99 = (A+B) − this |
+| B alone | `./benchmark client2_noisy` | Confirm B sustains its load without A |
 
 ## 🔬 Experiment Structure
 
@@ -110,17 +108,14 @@ four isolation conditions from the thesis:
 
 | Condition | Setup | Expected outcome |
 |---|---|---|
-| Baseline | A alone (`victim_alone`) | p99 flat; cache-hit ≈ 100% |
+| Baseline | A alone (`client1_steady`) | p99 flat; cache-hit ≈ 100% |
 | Interference | A + B, no isolation | A's p99 spikes; writer B worse than reader B at equal eviction |
 | cgroup v2 | A's `memory.low` = WS, no hard cap on B (`cgroup_isolated.ini`) | Partial recovery; residual p99 elevation under writer B |
 | Proposed policy | A + B under proposed policy | A's p99 within SLO for both B variants |
 
-**Key comparison:** `victim + b_scan_clean` vs `victim + b_randwrite_dirty` at the
-**same eviction rate** → does dirty writeback add p99 beyond clean eviction?
+**Key comparison:** edit `[client2_noisy]` to `randread` (or sequential `read`) vs `randwrite`, then run `dual` at the **same rate** → does dirty writeback add p99 beyond clean eviction?
 
-**Intensity sweep (Fig 1):** run `b_scan_clean` and `b_randwrite_dirty` across a
-range of `phase_*_rate_iops` (e.g. 1k / 5k / 20k / 50k / unlimited) to plot
-B's intensity (X) vs A's p99 (Y), one curve per mechanism.
+**Intensity sweep (Fig 1):** sweep `client2_noisy` `phase_0_rate_iops` (e.g. 1k / 5k / 20k / 50k / unlimited) for read vs write B, plot B intensity (X) vs A p99 (Y).
 
 ### Axes that matter (and ones that don't)
 
@@ -222,14 +217,14 @@ concurrently under cgroups — this is the experiment that produces the p99 resu
 ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
 ```
 
-### Run a Single Workload (characterization / baselines)
+### Run a Single Client (Case 1 baselines)
 
 ```bash
-# Baseline: victim alone
-./benchmark -v victim_alone
+# A alone
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1a client1_steady
 
-# Characterize one noisy-neighbor variant on its own
-./benchmark b_randwrite_dirty
+# B alone (match phase_0_pattern you use in dual: randread or randwrite)
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1b client2_noisy
 ```
 
 ### Run Everything
@@ -252,9 +247,9 @@ concurrently under cgroups — this is the experiment that produces the p99 resu
 The primary signal is **Tenant A's p99 read latency**, compared across
 conditions and across B variants:
 
-- **A alone** → p99 flat, near cache-hit latency.
-- **A + `b_scan_clean`** → p99 rises from eviction/re-faults (Mechanism 1).
-- **A + `b_randwrite_dirty`** → p99 rises **further** at the same eviction rate,
+- **A alone** (`client1_steady`) → p99 flat, near cache-hit latency.
+- **A + B (`randread` / sequential `read`)** → p99 rises from eviction/re-faults (Mechanism 1).
+- **A + B (`randwrite`)** → p99 rises **further** at the same eviction rate,
   the extra delta attributable to writeback queue contention (Mechanism 2).
 - **A + B under cgroup `memory.low`** → partial recovery for the reader B case;
   **residual** elevation for the writer B case = the "existing tools insufficient"
@@ -291,8 +286,7 @@ tenant's activity churns another's cache.
 - **PSI (`some`/`full`, memory + io)** — per-cgroup stall time; from `psi/`.
 - **iostat read vs. write latency & queue depth** — surfaces writeback contention.
 - **IOPS / BW** — secondary throughput context, not the objective.
-- *(Planned, TODO in `README.md`)* `/proc/vmstat` `nr_dirty` / `nr_writeback`
-  and per-cgroup `file_dirty` at 1s intervals.
+- `/proc/vmstat` `nr_dirty` / `nr_writeback` and per-cgroup `file_dirty` at 1s intervals.
 
 ## ⚙️ Configuration
 
@@ -330,12 +324,6 @@ phase_0_ioengine = libaio
 
 > **Reminder:** run writer-B pairings with `-m cached`. In `direct` mode fio
 > bypasses the page cache, so B produces no dirty pages and Mechanism 2 vanishes.
-
-**Planned fields (not yet parsed — see TODO in `README.md`):**
-`phase_N_random_distribution` (e.g. `zipf:1.2`) for the victim's hot set, and
-`phase_N_fdatasync` / `phase_N_fsync` (flush cadence) for the checkpoint/WAL
-B variants. These require adding fields to `PhaseConfig` and the fio command
-builders in `benchmark.c`.
 
 ## 📋 Test Results
 
@@ -500,16 +488,10 @@ Requires `--cgroup-config` for per-tenant memstat/PSI/dirty (not recorded with `
 
 | Section | Role |
 |---------|------|
-| `client1_steady` | Tenant A — rate-limited hot-set `randread` (victim in `dual`) |
-| `client2_noisy` | Tenant B — default buffered `randwrite` (noisy neighbor in `dual`) |
-| `victim_alone` | A alone baseline |
-| `b_scan_clean` | Mechanism 1 — sequential clean read |
-| `b_randwrite_dirty` | Mechanism 2 — buffered random writer |
-| `b_mixed` | Mixed `randrw` |
-| `b_checkpoint` | Sequential write + `fdatasync=1000` |
-| `b_wal_append` | Sequential write + `fdatasync=32` |
+| `client1_steady` | Tenant A — rate-limited `randread`; victim in `dual`; run alone for Case 1a |
+| `client2_noisy` | Tenant B — default `randwrite`; noisy neighbor in `dual`; edit `phase_0_*` for Mechanism 1 vs 2; run alone for Case 1b |
 
-Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime`, `ioengine`, `rwmixread`, `random_distribution` (e.g. `zipf:1.2`), `fdatasync`, `fsync`. For `dual`, copy a B variant's `phase_0_*` into `[client2_noisy]`.
+Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime`, `ioengine`, `rwmixread`, `random_distribution` (e.g. `zipf:1.2`), `fdatasync`, `fsync`.
 
 ### Quick start
 

@@ -15,7 +15,7 @@ clean:
 
 # Run a single-workload baseline
 test: $(TARGET)
-	./$(TARGET) -v victim_alone
+	./$(TARGET) -v client1_steady
 
 # Run every workload defined in the config
 run-all: $(TARGET)
