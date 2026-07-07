@@ -137,7 +137,7 @@ B's intensity (X) vs A's p99 (Y), one curve per mechanism.
 ## 🧪 Experiment Cases (change one variable at a time)
 
 These cases form a **controlled progression**: hold the two tenants
-(`client1_steady`, `client2_bursty`), their patterns, runtime, and block size
+(`client1_steady`, `client2_noisy`), their patterns, runtime, and block size
 fixed, and change **exactly one knob per step** so any change in A's p99 or
 refault delta is attributable to that knob. Each case is a delta from the one
 before it.
@@ -149,7 +149,7 @@ before it.
 | 3 | Shared Sequential | Concurrent | **no memory limits** (`--no-cgroup`) | remove cgroup memory limits (shared pool) | Raw interference with nothing protecting A |
 | 4 | Shared Client 2 Random Read | Concurrent | shared, parent `memory.max = 512M` | B → 48G file, `randread`, under tiny shared cap | Heavy eviction pressure: B's working set ≫ cache |
 | 5 | Shared Client 1 Limited | Concurrent | shared, `client1_steady memory.max = 1G` | cap the **victim's** memory | Whether limiting A (not B) helps or hurts A's p99 |
-| 6 | Shared Client 2 Limited | Concurrent | shared, `client2_bursty memory.max = 1G` | cap the **aggressor's** memory | The standard mitigation: does capping B bound A's p99? |
+| 6 | Shared Client 2 Limited | Concurrent | shared, `client2_noisy memory.max = 1G` | cap the **aggressor's** memory | The standard mitigation: does capping B bound A's p99? |
 
 **How to read the progression:**
 - **1 → 2:** adds concurrency but keeps isolation → expect A's p99 stays near baseline.
@@ -164,7 +164,7 @@ before it.
 ```bash
 # Case 1 — Isolated Baselines (run each client on its own, no contention)
 ./benchmark client1_steady
-./benchmark client2_bursty
+./benchmark client2_noisy
 
 # Case 2 — Isolated Clients (concurrent, isolated cgroups)
 sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached dual
@@ -180,7 +180,7 @@ For Cases 4–6, change the single `memory.max` line in the cgroup config (keep
 everything else identical to Case 3's shared layout):
 
 ```ini
-# Case 4 — parent (shared) cap = 512M, and set client2_bursty file_size = 48G
+# Case 4 — parent (shared) cap = 512M, and set client2_noisy file_size = 48G
 [clients]
 cgroup_name = clients
 memory.max = 512M
@@ -190,7 +190,7 @@ memory.max = 512M
 memory.max = 1G
 
 # Case 6 — cap only the aggressor
-[client2_bursty]
+[client2_noisy]
 memory.max = 1G
 ```
 
@@ -208,7 +208,7 @@ side by side.
 
 ### Run a Dual-Client Interference Experiment (primary mode)
 
-`dual` mode runs `client1_steady` (Tenant A) and `client2_bursty` (Tenant B)
+`dual` mode runs `client1_steady` (Tenant A) and `client2_noisy` (Tenant B)
 concurrently under cgroups — this is the experiment that produces the p99 result.
 
 ```bash
@@ -275,11 +275,11 @@ tenant's activity churns another's cache.
 **client1_steady:**
   phase 2:          300 pages (     1.2 MiB)
 
-**client2_bursty:**
+**client2_noisy:**
   phase 2:       25,000 pages (    97.7 MiB)
 
-  Refault comparison (client1_steady vs client2_bursty):
-    phase 2: client1_steady=300  client2_bursty=25,000  → client2_bursty refaulted 83.3× more
+  Refault comparison (client1_steady vs client2_noisy):
+    phase 2: client1_steady=300  client2_noisy=25,000  → client2_noisy refaulted 83.3× more
 ```
 
 ## 🔍 Key Metrics
@@ -316,7 +316,7 @@ phase_0_numjobs = 4
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 
-[client2_bursty]                 ; Tenant B — buffered dirty writer (Mechanism 2)
+[client2_noisy]                 ; Tenant B — buffered dirty writer (Mechanism 2)
 description = Random writer generating dirty writeback
 file_size = 8G
 phase_0_pattern = randwrite
@@ -429,10 +429,10 @@ make clean
 
 ### Custom Configuration
 Create or modify `fairness_configs.ini`. For dual-client experiments the two
-sections must be named `client1_steady` (Tenant A) and `client2_bursty`
+sections must be named `client1_steady` (Tenant A) and `client2_noisy`
 (Tenant B); use phase-prefixed keys for multi-phase runs:
 ```ini
-[client2_bursty]
+[client2_noisy]
 description = Custom B: mixed random read/write neighbor
 file_size = 8G                    ; ~4× the 2G cgroup cap
 phase_0_pattern = randrw

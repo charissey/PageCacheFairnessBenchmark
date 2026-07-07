@@ -2,7 +2,7 @@
  * benchmark.c — Page-Cache Fairness Benchmark harness.
  *
  * Pairs a latency-sensitive victim (Tenant A / client1_steady) against a noisy
- * neighbor (Tenant B / client2_bursty) under cgroup v2 and measures A's p99
+ * neighbor (Tenant B / client2_noisy) under cgroup v2 and measures A's p99
  * read latency, decomposing the spike into:
  *   Mechanism 1 — LRU eviction / refaults (clean scan)
  *   Mechanism 2 — eviction + dirty writeback contention (buffered writer)
@@ -160,6 +160,17 @@ static void ensure_subdir(const char *base, const char *sub, char *out, size_t n
     /* builds base/sub and creates the directory into out if it doesn't exist */
     snprintf(out, n, "%s/%s", base, sub);
     ensure_dir(out);
+}
+
+/* Flatten cgroup path for result filenames (clients/a -> clients_a). */
+static void cgroup_file_label(const char *cg, char *out, size_t n) {
+    size_t j = 0;
+    for (size_t i = 0; cg[i] && j + 1 < n; i++) {
+        char c = cg[i];
+        if (c == '/') c = '_';
+        out[j++] = c;
+    }
+    out[j] = '\0';
 }
 
 /* ------------------------------------------------------------------ *
@@ -462,7 +473,8 @@ static long read_psi_total(const char *cgroup_name, const char *resource) {
 /*
  * Runs in a forked child. Every SAMPLE_INTERVAL_S seconds appends:
  *   dirty/vmstat_<mode>.csv       : ts, nr_dirty, nr_writeback, pgpgin, pgscan_kswapd
- *   dirty/<cg>_<mode>_dirty.csv   : ts, file_dirty, file_writeback (per cgroup)
+ *   dirty/<cg>_<mode>_dirty.csv   : ts, file_dirty, file_writeback (per cgroup;
+ *                                    cgroup path slashes -> underscores in name)
  *   psi/<cg>_<mode>.csv           : ts, mem_some_total_us, io_some_total_us
  * Exits on SIGTERM/SIGINT.
  */
@@ -483,15 +495,19 @@ static void run_sampler(const char *mode, char cgroup_names[][MAX_STR], int n_cg
     FILE *cgf[MAX_CGROUPS] = {0};
     FILE *psf[MAX_CGROUPS] = {0};
     for (int i = 0; i < n_cg && i < MAX_CGROUPS; i++) {
+        char label[MAX_STR];
+        cgroup_file_label(cgroup_names[i], label, sizeof(label));
         char p[MAX_CMD];
-        snprintf(p, sizeof(p), "%s/%s_%s_dirty.csv", dirty_dir, cgroup_names[i], mode);
+        snprintf(p, sizeof(p), "%s/%s_%s_dirty.csv", dirty_dir, label, mode);
         cgf[i] = fopen(p, "w");
         if (cgf[i]) fprintf(cgf[i], "ts,file_dirty,file_writeback\n");
+        else VLOG("could not open dirty csv %s: %s", p, strerror(errno));
 
         if (opt.use_psi) {
-            snprintf(p, sizeof(p), "%s/%s_%s.csv", psi_dir, cgroup_names[i], mode);
+            snprintf(p, sizeof(p), "%s/%s_%s.csv", psi_dir, label, mode);
             psf[i] = fopen(p, "w");
             if (psf[i]) fprintf(psf[i], "ts,mem_some_total_us,io_some_total_us\n");
+            else VLOG("could not open psi csv %s: %s", p, strerror(errno));
         }
     }
 
@@ -808,7 +824,7 @@ static void usage(const char *argv0) {
 "\n"
 "Modes:\n"
 "  <workload>   Run a single client section from the config (baseline/characterization)\n"
-"  dual         Run client1_steady (A) + client2_bursty (B) concurrently (primary experiment)\n"
+"  dual         Run client1_steady (A) + client2_noisy (B) concurrently (primary experiment)\n"
 "  all          Run every client section defined in the config\n"
 "\n"
 "Options:\n"
@@ -868,7 +884,7 @@ int main(int argc, char **argv) {
     const CgroupSet *cgptr = have_cgset ? &cgset : NULL;
 
     if (!strcmp(workload, "dual")) {
-        const char *names[] = { "client1_steady", "client2_bursty" };
+        const char *names[] = { "client1_steady", "client2_noisy" };
         for (int i = 0; i < 2; i++)
             if (!find_client(&cfg, names[i])) { INFO("error: dual needs section [%s]", names[i]); return 1; }
         run_for_modes(&cfg, cgptr, names, 2);

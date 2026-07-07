@@ -24,7 +24,7 @@ Two tenants share one machine's Linux page cache:
 - **Tenant A — the victim (`client1_steady`)**: a latency-sensitive, rate-limited
   random reader whose hot set *fits* in cache. We measure its **p99 read
   latency**.
-- **Tenant B — the noisy neighbor (`client2_bursty`)**: a workload that pollutes
+- **Tenant B — the noisy neighbor (`client2_noisy`)**: a workload that pollutes
   the cache and/or dirties pages.
 
 The thesis decomposes A's p99 spike into two mechanisms:
@@ -218,7 +218,7 @@ every later delta subtracts from.
 
 ```bash
 sudo ./benchmark -m cached -o results/case1_a client1_steady
-sudo ./benchmark -m cached -o results/case1_b client2_bursty
+sudo ./benchmark -m cached -o results/case1_b client2_noisy
 ```
 *Isolates:* standalone p99 / throughput per client; confirms B isn't
 self-throttled.
@@ -241,7 +241,7 @@ sudo ./benchmark --no-cgroup -m cached -o results/case3 dual
 ### Step 4 — Heavy eviction pressure (B ≫ cache under a tiny cap)
 
 Edit `cgroup_shared.ini` so the parent cap is `512M`, and set
-`client2_bursty`'s `file_size = 48G` with `phase_0_pattern = randread` in
+`client2_noisy`'s `file_size = 48G` with `phase_0_pattern = randread` in
 `fairness_configs.ini`. (For strict single-variable rigor, split into 4a =
 file-size change only, 4b = add the 512M cap.)
 
@@ -261,7 +261,7 @@ sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/case5 du
 
 ### Step 6 — Cap only the aggressor (the standard mitigation)
 
-Set `[client2_bursty] memory.max = 1G` in `cgroup_shared.ini`.
+Set `[client2_noisy] memory.max = 1G` in `cgroup_shared.ini`.
 
 ```bash
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/case6 dual
@@ -274,9 +274,9 @@ Run the victim against a clean scanner, then against a buffered writer, matching
 their eviction rate (tune `phase_0_rate_iops`):
 
 ```bash
-# Point client2_bursty at b_scan_clean's params, or run the pairing directly:
+# Point client2_noisy at b_scan_clean's params, or run the pairing directly:
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/scan  dual   # B = clean scan
-# then swap client2_bursty to the b_randwrite_dirty params and:
+# then swap client2_noisy to the b_randwrite_dirty params and:
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached -o results/write dual   # B = dirty writer
 
 ./benchmark_analysis.py results/scan
@@ -299,7 +299,7 @@ one curve per mechanism.
 ./benchmark [options] <workload | dual | all>
 
   <workload>   Run a single [section] from the config (baseline/characterization)
-  dual         Run client1_steady (A) + client2_bursty (B) concurrently (primary)
+  dual         Run client1_steady (A) + client2_noisy (B) concurrently (primary)
   all          Run every [section] in the config
 
   -c, --config PATH        Workload ini            (default: fairness_configs.ini)
@@ -333,7 +333,7 @@ phase_0_runtime = 60
 phase_0_ioengine = libaio
 phase_0_random_distribution = zipf:1.2 ; [TODO-1] skew so refaults hurt
 
-[client2_bursty]                       ; Tenant B — buffered dirty writer (Mech 2)
+[client2_noisy]                       ; Tenant B — buffered dirty writer (Mech 2)
 description = Random writer generating dirty writeback
 file_size = 8G                         ; ~4x the cap
 phase_0_pattern = randwrite
@@ -345,7 +345,7 @@ phase_0_runtime = 60
 phase_0_ioengine = libaio
 ```
 
-**B variants also defined** (swap into `client2_bursty` or run standalone):
+**B variants also defined** (swap into `client2_noisy` or run standalone):
 `b_scan_clean` (Mech 1, 1M sequential read), `b_randwrite_dirty` (Mech 2),
 `b_mixed` (`randrw`, `rwmixread=50`), `b_checkpoint` (`fdatasync=1000`),
 `b_wal_append` (`fdatasync=32`).
