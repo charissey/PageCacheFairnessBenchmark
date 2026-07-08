@@ -82,11 +82,11 @@ because interference depends on working-set-to-cache ratio.
 
 ### Tenant A — the victim (what we measure)
 
-`client1_steady`: 1G `randread`, 4k, rate-limited (`rate_iops=5000`, `numjobs=4`), cached mode. Report clat **p99**. Optional `phase_0_random_distribution = zipf:1.2` skews the hot set so refaults hurt.
+`client1_steady`: 1G `read`, 4k, rate-limited (`rate_iops=5000`, `numjobs=1`), cached mode. Report clat **p99**. Optional `phase_0_random_distribution = zipf:1.2` skews the hot set so refaults hurt.
 
 ### Tenant B — the noisy neighbor
 
-`client2_noisy`: default **Mechanism 2** — 8G `randwrite`, 4k, buffered (`rate_iops=20000`, `numjobs=4`, `iodepth=32`). Edit `phase_0_*` in `[client2_noisy]` for other B behaviors:
+`client2_noisy`: default **Mechanism 2** — 8G `randread`, 4k, buffered (`rate_iops=20000`, `numjobs=1`, `iodepth=32`). Edit `phase_0_*` in `[client2_noisy]` for other B behaviors:
 
 | Pattern | bs | Mechanism |
 |---------|-----|-----------|
@@ -125,9 +125,10 @@ four isolation conditions from the thesis:
   pages, so eviction is free. Use `zipf` for the victim so refaults actually hurt.
 - **Buffered vs direct:** writer B must run in **cached** mode — `direct=1`
   generates no dirty page cache and disables Mechanism 2.
-- **`numjobs` over `iodepth`** for concurrency: buffered I/O degrades toward
-  synchronous, so `iodepth` barely varies true concurrency in cached mode.
-  Reserve `iodepth` for the `direct` no-cache baseline.
+- **`numjobs=1`** per tenant (single fio thread): keeps per-I/O latency easy to
+  interpret. Buffered I/O degrades toward synchronous, so `iodepth` barely varies
+  true concurrency in cached mode on the victim; reserve higher `iodepth` for B
+  or the `direct` no-cache baseline.
 
 ## 🧪 Experiment Cases (change one variable at a time)
 
@@ -300,24 +301,24 @@ Edit `fairness_configs.ini` to modify per-phase parameters:
 Multi-phase configuration format (phase-prefixed keys):
 ```ini
 [client1_steady]                 ; Tenant A — the victim
-description = Hot-set random reader; measure p99
+description = Hot-set sequential reader; report clat p99
 file_size = 1G
-phase_0_pattern = randread
+phase_0_pattern = read
 phase_0_block_size = 4k
 phase_0_rate_iops = 5000
 phase_0_iodepth = 1
-phase_0_numjobs = 4
+phase_0_numjobs = 1
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 
-[client2_noisy]                 ; Tenant B — buffered dirty writer (Mechanism 2)
-description = Random writer generating dirty writeback
+[client2_noisy]                 ; Tenant B — random read neighbor (Mechanism 1)
+description = Random buffered random reader
 file_size = 8G
-phase_0_pattern = randwrite
+phase_0_pattern = randread
 phase_0_block_size = 4k
 phase_0_rate_iops = 20000
 phase_0_iodepth = 32
-phase_0_numjobs = 4
+phase_0_numjobs = 1
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 ```
@@ -426,7 +427,7 @@ file_size = 8G                    ; ~4× the 2G cgroup cap
 phase_0_pattern = randrw
 phase_0_block_size = 4k
 phase_0_rate_iops = 20000
-phase_0_numjobs = 4
+phase_0_numjobs = 1
 phase_0_iodepth = 32
 phase_0_runtime = 120
 phase_0_ioengine = libaio

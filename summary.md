@@ -316,25 +316,24 @@ cap** (2G shared), not as fixed absolutes. Keys are phase-prefixed
 
 ```ini
 [client1_steady]                       ; Tenant A — the victim
-description = Hot-set random reader; measure p99
+description = Hot-set sequential reader; report clat p99
 file_size = 1G                         ; ~0.5x the 2G cap (fits in cache)
-phase_0_pattern = randread
+phase_0_pattern = read
 phase_0_block_size = 4k
 phase_0_rate_iops = 5000               ; rate-limit keeps p99 an SLO signal
 phase_0_iodepth = 1
-phase_0_numjobs = 4                    ; prefer numjobs over iodepth for cached
+phase_0_numjobs = 1                    ; single fio thread per tenant
 phase_0_runtime = 60
 phase_0_ioengine = libaio
-phase_0_random_distribution = zipf:1.2 ; [TODO-1] skew so refaults hurt
 
-[client2_noisy]                       ; Tenant B — buffered dirty writer (Mech 2)
-description = Random writer generating dirty writeback
+[client2_noisy]                       ; Tenant B — random read neighbor (Mech 1)
+description = Random buffered random reader
 file_size = 8G                         ; ~4x the cap
-phase_0_pattern = randwrite
+phase_0_pattern = randread
 phase_0_block_size = 4k
 phase_0_rate_iops = 20000
 phase_0_iodepth = 32
-phase_0_numjobs = 4
+phase_0_numjobs = 1
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 ```
