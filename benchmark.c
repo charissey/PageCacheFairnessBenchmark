@@ -541,6 +541,7 @@ static void run_sampler(const char *mode, char cgroup_names[][MAX_STR], int n_cg
     _exit(0);
 }
 
+/* fork a child process to sample /proc/vmstat, memory.stat, and PSI */
 static pid_t start_sampler(const char *mode, char cgroup_names[][MAX_STR], int n_cg) {
     if (!is_linux()) { VLOG("sampler skipped (not Linux)"); return -1; }
     pid_t pid = fork();
@@ -678,7 +679,8 @@ static void drop_caches(void) {
 static void wrap_with_cgroup(char *cmd, size_t cap, const char *cg_path) {
     if (!cg_path || !is_linux()) return;
     char buf[MAX_CMD];
-    /* echo our shell pid into cgroup.procs, then exec fio in-place */
+    /* echo $$ is the shell pid, which gets written to cgroup.procs (moves process into the cgroup) */
+    /* then, exec replaces what the shell is running from shell script with the fio command */
     snprintf(buf, sizeof(buf),
              "echo $$ > %s/cgroup.procs 2>/dev/null; exec %s", cg_path, cmd);
     snprintf(cmd, cap, "%s", buf);
@@ -697,15 +699,19 @@ static pid_t spawn_client_phase(const ClientConfig *c, const PhaseConfig *p,
     snprintf(json_out, sizeof(json_out), "%s/%s_%s_p%d.json",
              opt.output_dir, c->name, mode_str, (int)(p - c->phases));
 
+    /* build but don't execute the fio command (which performs the workload described by the PhaseConfig) */
     build_fio_cmd(cmd, sizeof(cmd), c, p, test_file, json_out, cached);
+    /* build command to move the process into the cgroup and then execute the fio command */
     wrap_with_cgroup(cmd, sizeof(cmd), cg_path);
     VLOG("exec: %s", cmd);
-
+    /* get the child process pid */
     pid_t pid = fork();
     if (pid == 0) {
+        /* child: execute the fio command */
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
     }
+    /* parent: return the child process pid */
     return pid;
 }
 
@@ -739,6 +745,7 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
     }
 
     /* max phase count across clients */
+    /* in current implementation, we only run one phase */
     int max_phases = 1;
     for (int i = 0; i < n_clients; i++) {
         ClientConfig *c = find_client(cfg, client_names[i]);
@@ -751,6 +758,7 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         if (c) ensure_test_file(c);
     }
 
+    /* fork child processes to get stats */
     pid_t sampler = start_sampler(mode_str, cg_names, n_cg);
     pid_t iostat  = start_iostat(mode_str);
 
@@ -758,7 +766,9 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         INFO("--- phase %d ---", ph);
         if (cached) drop_caches();
 
-        /* before-snapshot */
+        /* before-snapshot of memory.stat (refaults) to calculate workingset_refault_file_delta */
+        /* refaults are a running total of page faults that have occurred per cgroup created */
+        /* if we use /sys/fs/cgroup/clients/client1_steady across multiple benchmark runs, the counter keeps climbing */
         long prev_refault[MAX_CLIENTS];
         for (int i = 0; i < n_clients; i++) {
             prev_refault[i] = -1;
@@ -768,24 +778,28 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         }
 
         /* spawn all clients' phase-ph concurrently */
-        pid_t pids[MAX_CLIENTS]; int npids = 0;
+        pid_t pids[MAX_CLIENTS]; // int npids = 0;
         for (int i = 0; i < n_clients; i++) {
             ClientConfig *c = find_client(cfg, client_names[i]);
             if (!c || ph >= c->num_phases || !c->phases[ph].present) { pids[i] = -1; continue; }
             char cgbuf[MAX_CMD];
+            /* get the cgroup path for the client */
             const char *cg = cgpath_or_null(cgset, client_names[i], cgbuf, sizeof(cgbuf));
+            /* fork+exec the client's phase in the background */
+            /* returns the child process pid */
             pids[i] = spawn_client_phase(c, &c->phases[ph], mode_str, cached, cg);
-            if (pids[i] > 0) npids++;
+            // if (pids[i] > 0) npids++;
         }
 
-        /* wait for all */
+        /* wait for all clients' phases to complete as they run concurrently */
         for (int i = 0; i < n_clients; i++)
             if (pids[i] > 0) waitpid(pids[i], NULL, 0);
-        (void)npids;
+        // (void)npids;
 
         /* after-snapshot -> computes workingset_refault_file_delta */
         for (int i = 0; i < n_clients; i++) {
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
+            
             if (g) record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "after",
                                   prev_refault[i], NULL);
         }

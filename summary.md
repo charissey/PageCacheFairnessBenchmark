@@ -4,7 +4,7 @@ This document explains, in detail, **what this benchmark does, how the code is
 structured, what it measures, and the exact step-by-step commands to run the
 experiments on a Linux host.**
 
-It accompanies the research spec and implementation plan in `README.md. Where that describes *what* to build, this file describes *what was built here* and *how to operate it*.
+It accompanies the research spec and implementation plan in `README.md`. Where that describes *what* to build, this file describes *what was built here* and *how to operate it*.
 
 > **Platform:** the interference experiments require **Linux with cgroup v2**.
 > Everything cgroup/PSI/`memory.stat`/`/proc/vmstat`/`iostat`-related is
@@ -19,7 +19,7 @@ It accompanies the research spec and implementation plan in `README.md. Where th
 Two tenants share one machine's Linux page cache:
 
 - **Tenant A — the victim (`client1_steady`)**: a latency-sensitive, rate-limited
-  random reader whose hot set *fits* in cache. We measure its **p99 read
+  sequential reader whose hot set *fits* in cache. We measure its **p99 read
   latency**.
 - **Tenant B — the noisy neighbor (`client2_noisy`)**: a workload that pollutes
   the cache and/or dirties pages.
@@ -51,7 +51,8 @@ penalty beyond what memory sizing alone can fix — the core result.
 | `benchmark.c` | The whole harness: config parsing, fio command building, cgroup setup, run orchestration, telemetry sampling. |
 | `fairness_configs.ini` | Workload definitions: `client1_steady` + `client2_noisy` only. |
 | `cgroup_shared.ini` | Shared-pool cgroup layout (2G parent cap; both tenants under it). |
-| `cgroup_isolated.ini` | Isolated layout (`memory.low` floor for the victim, no hard cap on B). |
+| `cgroup_isolated.ini` | Isolated layout (separate per-tenant cgroups; `memory.low` optional — commented out by default). |
+| `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup). |
 | `Makefile` | Build + convenience run targets. |
 | `benchmark_analysis.py` | Reads a results dir and prints p99, refault deltas, dirty-page peaks, PSI stalls. |
 | `benchmark_results/` | Output (created on first run). |
@@ -161,8 +162,16 @@ stat -fc %T /sys/fs/cgroup
 cat /proc/pressure/memory
 ```
 
-Also ensure enough disk: B's files are 2–4× the cache cap, and Case 4 uses a
+Also ensure enough disk: default test files are 1G + 8G (~9 GB); Case 4 uses a
 48G file. `df -h .` before running.
+
+### cgroup pre-flight check
+
+```bash
+# Validate cgroup v2 and ini layout before running experiments
+sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
+sudo ./check_cgroups.sh --cgroup-config cgroup_isolated.ini
+```
 
 ---
 
@@ -184,6 +193,7 @@ make clean      # remove the binary
 ```bash
 # A + B interference in cached mode, shared 2G cache pool.
 # sudo is required for drop_caches + cgroup setup.
+sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
 
 # Analyze
@@ -223,8 +233,10 @@ self-throttled.
 ```bash
 sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case2 dual
 ```
-*Isolates:* whether cgroup `memory.low` protection keeps A's p99 ≈ baseline when
-both run together. *Expect:* p99 stays near baseline.
+*Isolates:* whether separate per-tenant cgroups keep A's p99 ≈ baseline when
+both run together. Uncomment `memory.low = 1G` under `[client1_steady]` in
+`cgroup_isolated.ini` to test `memory.low` protection. *Expect:* p99 stays near
+baseline with isolation.
 
 ### Step 3 — Concurrent, NO memory limits (raw interference)
 
@@ -312,26 +324,27 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
 
 Sections in `fairness_configs.ini`. Sizes are chosen **relative to the cgroup
 cap** (2G shared), not as fixed absolutes. Keys are phase-prefixed
-(`phase_N_...`) so a section can define multiple phases.
+(`phase_N_...`) so a section can define multiple phases. The block below matches
+the checked-in defaults (`read` + `randread`, Mechanism 1 pairing):
 
 ```ini
 [client1_steady]                       ; Tenant A — the victim
-description = Hot-set sequential reader; report clat p99
+description = Hot-set sequential reader; report clat p99 (rate-limited SLO signal)
 file_size = 1G                         ; ~0.5x the 2G cap (fits in cache)
 phase_0_pattern = read
 phase_0_block_size = 4k
-phase_0_rate_iops = 5000               ; rate-limit keeps p99 an SLO signal
+phase_0_rate_iops = 10000              ; rate-limit keeps p99 an SLO signal
 phase_0_iodepth = 1
-phase_0_numjobs = 1                    ; single fio thread per tenant
+phase_0_numjobs = 1
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 
-[client2_noisy]                       ; Tenant B — random read neighbor (Mech 1)
-description = Random buffered random reader
+[client2_noisy]                       ; Tenant B — random read neighbor (Mech 1 default)
+description = Random buffered random reader (Mechanism 1)
 file_size = 8G                         ; ~4x the cap
 phase_0_pattern = randread
 phase_0_block_size = 4k
-phase_0_rate_iops = 20000
+phase_0_rate_iops = 80000
 phase_0_iodepth = 32
 phase_0_numjobs = 1
 phase_0_runtime = 60
@@ -364,8 +377,9 @@ for Mechanism 1 (`read` / `randread`) vs Mechanism 2 (`randwrite`).
 2. A + B (`randread` / sequential read) → p99 rises from refaults (Mechanism 1).
 3. A + B (`randwrite`) → p99 rises **further** at the same eviction rate
    (Mechanism 2), with elevated `nr_writeback`.
-4. A + B under `memory.low` → partial recovery for read B; **residual** p99
-   elevation for write B — motivating cross-layer memory↔I/O coordination.
+4. A + B under cgroup `memory.low` (uncomment in `cgroup_isolated.ini`) → partial
+   recovery for read B; **residual** p99 elevation for write B — motivating
+   cross-layer memory↔I/O coordination.
 
 ---
 
@@ -374,7 +388,7 @@ for Mechanism 1 (`read` / `randread`) vs Mechanism 2 (`randwrite`).
 | Symptom | Cause / fix |
 |---|---|
 | `warning: open .../memory.max: ...` | Run under `sudo`; ensure cgroup v2 (`stat -fc %T /sys/fs/cgroup` = `cgroup2fs`). |
-| cgroup knobs don't stick / files missing | Parent's `cgroup.subtree_control` lacks the controller. The harness writes `+memory +io`, but a restrictive systemd delegation can still block it; run inside a delegated scope (`systemd-run --user -p Delegate=yes ...`) or as root. |
+| cgroup knobs don't stick / files missing | Parent's `cgroup.subtree_control` lacks the controller. The harness writes `+memory +io`, but a restrictive systemd delegation can still block it; run `sudo ./check_cgroups.sh` first, or run inside a delegated scope (`systemd-run --user -p Delegate=yes ...`) or as root. |
 | Empty `psi/` dir | PSI disabled in kernel, or you passed `--no-psi`. Check `cat /proc/pressure/memory`. |
 | Empty `iostat/` | `sysstat` not installed (`apt-get install sysstat`). |
 | `drop_caches` warning | Needs root; run with `sudo`. |

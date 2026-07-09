@@ -35,7 +35,8 @@ writeback amplifies the miss penalty beyond what memory sizing alone can fix.
 pagecachefairnessbenchmark/
 ├── fairness_configs.ini           # Workload definitions (victim + B variants)
 ├── cgroup_shared.ini              # Shared-cache cgroup layout (2G pool)
-├── cgroup_isolated.ini            # Isolated / memory.low cgroup layout
+├── cgroup_isolated.ini            # Isolated per-tenant cgroup layout
+├── check_cgroups.sh               # Pre-flight cgroup v2 validation script
 ├── benchmark.c                    # C benchmark implementation
 ├── benchmark                      # Compiled C binary
 ├── Makefile                       # Build configuration
@@ -49,14 +50,14 @@ pagecachefairnessbenchmark/
 └── README.md                      # Research thesis and experiment plan
 ```
 
-## Gettings Started
+## Getting Started
 
 ### Prerequisites
 - `fio` (I/O benchmark tool)
 - `gcc` with C11 support
 - `make` (build tool)
 - `iostat` (I/O monitoring)
-- Sufficient disk space for test files (17+ GB)
+- Sufficient disk space for test files (~9 GB default; 48+ GB for Case 4)
 
 ### Install Dependencies (macOS)
 ```bash
@@ -82,11 +83,11 @@ because interference depends on working-set-to-cache ratio.
 
 ### Tenant A — the victim (what we measure)
 
-`client1_steady`: 1G `read`, 4k, rate-limited (`rate_iops=5000`, `numjobs=1`), cached mode. Report clat **p99**. Optional `phase_0_random_distribution = zipf:1.2` skews the hot set so refaults hurt.
+`client1_steady`: 1G sequential `read`, 4k, rate-limited (`rate_iops=10000`, `numjobs=1`), cached mode. Report clat **p99**. Optional `phase_0_random_distribution = zipf:1.2` skews the hot set so refaults hurt.
 
 ### Tenant B — the noisy neighbor
 
-`client2_noisy`: default **Mechanism 2** — 8G `randread`, 4k, buffered (`rate_iops=20000`, `numjobs=1`, `iodepth=32`). Edit `phase_0_*` in `[client2_noisy]` for other B behaviors:
+`client2_noisy`: default **Mechanism 1** — 8G `randread`, 4k, buffered (`rate_iops=80000`, `numjobs=1`, `iodepth=32`). Edit `phase_0_*` in `[client2_noisy]` for other B behaviors:
 
 | Pattern | bs | Mechanism |
 |---------|-----|-----------|
@@ -110,7 +111,7 @@ four isolation conditions from the thesis:
 |---|---|---|
 | Baseline | A alone (`client1_steady`) | p99 flat; cache-hit ≈ 100% |
 | Interference | A + B, no isolation | A's p99 spikes; writer B worse than reader B at equal eviction |
-| cgroup v2 | A's `memory.low` = WS, no hard cap on B (`cgroup_isolated.ini`) | Partial recovery; residual p99 elevation under writer B |
+| cgroup v2 | Separate per-tenant cgroups (`cgroup_isolated.ini`; uncomment `memory.low` on A to test protection) | Partial recovery with `memory.low`; residual p99 elevation under writer B |
 | Proposed policy | A + B under proposed policy | A's p99 within SLO for both B variants |
 
 **Key comparison:** edit `[client2_noisy]` to `randread` (or sequential `read`) vs `randwrite`, then run `dual` at the **same rate** → does dirty writeback add p99 beyond clean eviction?
@@ -125,10 +126,9 @@ four isolation conditions from the thesis:
   pages, so eviction is free. Use `zipf` for the victim so refaults actually hurt.
 - **Buffered vs direct:** writer B must run in **cached** mode — `direct=1`
   generates no dirty page cache and disables Mechanism 2.
-- **`numjobs=1`** per tenant (single fio thread): keeps per-I/O latency easy to
-  interpret. Buffered I/O degrades toward synchronous, so `iodepth` barely varies
-  true concurrency in cached mode on the victim; reserve higher `iodepth` for B
-  or the `direct` no-cache baseline.
+- **`numjobs` over `iodepth`** for concurrency: buffered I/O degrades toward
+  synchronous, so `iodepth` barely varies true concurrency in cached mode.
+  Reserve `iodepth` for the `direct` no-cache baseline.
 
 ## 🧪 Experiment Cases (change one variable at a time)
 
@@ -141,7 +141,7 @@ before it.
 | Case | Name | Concurrency | cgroup / memory config | The single variable changed | What it isolates |
 |---|---|---|---|---|---|
 | 1 | Isolated Baselines | Each client **alone** | n/a (no sharing) | — (reference point) | Standalone p99 / throughput per client; the baseline all deltas subtract from |
-| 2 | Isolated Clients | Concurrent | `cgroup_isolated.ini` (each client its own memory floor) | +concurrency, **with** isolation | Whether isolation keeps p99 ≈ baseline when both run together |
+| 2 | Isolated Clients | Concurrent | `cgroup_isolated.ini` (separate per-tenant cgroups) | +concurrency, **with** isolation | Whether separate cgroups keep p99 ≈ baseline when both run together |
 | 3 | Shared Sequential | Concurrent | **no memory limits** (`--no-cgroup`) | remove cgroup memory limits (shared pool) | Raw interference with nothing protecting A |
 | 4 | Shared Client 2 Random Read | Concurrent | shared, parent `memory.max = 512M` | B → 48G file, `randread`, under tiny shared cap | Heavy eviction pressure: B's working set ≫ cache |
 | 5 | Shared Client 1 Limited | Concurrent | shared, `client1_steady memory.max = 1G` | cap the **victim's** memory | Whether limiting A (not B) helps or hurts A's p99 |
@@ -252,7 +252,7 @@ conditions and across B variants:
 - **A + B (`randread` / sequential `read`)** → p99 rises from eviction/re-faults (Mechanism 1).
 - **A + B (`randwrite`)** → p99 rises **further** at the same eviction rate,
   the extra delta attributable to writeback queue contention (Mechanism 2).
-- **A + B under cgroup `memory.low`** → partial recovery for the reader B case;
+- **A + B under cgroup `memory.low`** (uncomment in `cgroup_isolated.ini`) → partial recovery for the reader B case;
   **residual** elevation for the writer B case = the "existing tools insufficient"
   result.
 
@@ -298,25 +298,25 @@ Edit `fairness_configs.ini` to modify per-phase parameters:
 - `file_size` — choose **relative to `memory.max`** (e.g. 0.5× cap for the
   victim's hot set, 2–4× cap for B), not a fixed absolute
 
-Multi-phase configuration format (phase-prefixed keys):
+Multi-phase configuration format (phase-prefixed keys; matches checked-in defaults):
 ```ini
 [client1_steady]                 ; Tenant A — the victim
-description = Hot-set sequential reader; report clat p99
+description = Hot-set sequential reader; report clat p99 (rate-limited SLO signal)
 file_size = 1G
 phase_0_pattern = read
 phase_0_block_size = 4k
-phase_0_rate_iops = 5000
+phase_0_rate_iops = 10000
 phase_0_iodepth = 1
 phase_0_numjobs = 1
 phase_0_runtime = 60
 phase_0_ioengine = libaio
 
-[client2_noisy]                 ; Tenant B — random read neighbor (Mechanism 1)
-description = Random buffered random reader
+[client2_noisy]                 ; Tenant B — random read neighbor (Mechanism 1 default)
+description = Random buffered random reader (Mechanism 1)
 file_size = 8G
 phase_0_pattern = randread
 phase_0_block_size = 4k
-phase_0_rate_iops = 20000
+phase_0_rate_iops = 80000
 phase_0_iodepth = 32
 phase_0_numjobs = 1
 phase_0_runtime = 60
@@ -360,19 +360,28 @@ which fio gcc make iostat
 make
 ```
 
+### cgroup pre-flight check
+```bash
+# Validate cgroup v2 before running experiments (Linux only)
+sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
+```
+
 ## 📊 Example Complete Workflow
 
 ```bash
 # 1. Build the benchmark
 make
 
-# 2. Run the A + B interference experiment in cached mode
+# 2. Validate cgroup setup (Linux)
+sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
+
+# 3. Run the A + B interference experiment in cached mode
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
 
-# 3. Analyze results (fio p99 + PSI + refault deltas)
+# 4. Analyze results (fio p99 + PSI + refault deltas)
 ./benchmark_analysis.py benchmark_results/
 
-# 4. View summary
+# 5. View summary
 cat benchmark_results/summary.txt
 ```
 
@@ -410,7 +419,7 @@ make clean
 - `make` or `make all`: Build the benchmark
 - `make clean`: Remove build artifacts
 - `make test`: Run a single workload test
-- `make benchmark`: Run all benchmarks
+- `make run-all`: Run all workloads (`./benchmark all`)
 - `make analyze`: Analyze existing results
 - `make workflow`: Complete build, test, analyze workflow
 
@@ -427,7 +436,7 @@ file_size = 8G                    ; ~4× the 2G cgroup cap
 phase_0_pattern = randrw
 phase_0_block_size = 4k
 phase_0_rate_iops = 20000
-phase_0_numjobs = 1
+phase_0_numjobs = 4
 phase_0_iodepth = 32
 phase_0_runtime = 120
 phase_0_ioengine = libaio
@@ -455,8 +464,9 @@ The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Expe
 | `benchmark.c` | Harness: INI parsing, cgroup setup, fio orchestration, telemetry sampler |
 | `Makefile` | `make` → `./benchmark` (`gcc -std=c11`) |
 | `fairness_configs.ini` | Workload definitions (victim, noisy neighbor, B variants) |
-| `cgroup_isolated.ini` | Per-tenant cgroups; `memory.low` on victim |
+| `cgroup_isolated.ini` | Per-tenant cgroups; optional `memory.low` (commented out by default) |
 | `cgroup_shared.ini` | Shared 2G parent pool; nested tenant cgroups |
+| `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup) |
 | `benchmark_analysis.py` | Summarize fio p99, refault deltas, dirty/vmstat peaks, PSI |
 | `benchmark_results/` | Default output directory (`-o` overrides) |
 
@@ -489,8 +499,8 @@ Requires `--cgroup-config` for per-tenant memstat/PSI/dirty (not recorded with `
 
 | Section | Role |
 |---------|------|
-| `client1_steady` | Tenant A — rate-limited `randread`; victim in `dual`; run alone for Case 1a |
-| `client2_noisy` | Tenant B — default `randwrite`; noisy neighbor in `dual`; edit `phase_0_*` for Mechanism 1 vs 2; run alone for Case 1b |
+| `client1_steady` | Tenant A — rate-limited sequential `read`; victim in `dual`; run alone for Case 1a |
+| `client2_noisy` | Tenant B — default `randread` (Mechanism 1); noisy neighbor in `dual`; edit `phase_0_*` for Mechanism 1 vs 2; run alone for Case 1b |
 
 Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime`, `ioengine`, `rwmixread`, `random_distribution` (e.g. `zipf:1.2`), `fdatasync`, `fsync`.
 
@@ -498,6 +508,7 @@ Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime
 
 ```bash
 make
+sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
 ./benchmark_analysis.py benchmark_results/
 ```

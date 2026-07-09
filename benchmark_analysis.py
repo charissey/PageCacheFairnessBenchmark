@@ -5,7 +5,7 @@ Reads a results directory produced by ./benchmark and reports:
   * Tenant A p99 / p999 read latency (from fio clat_ns.percentile)
   * IOPS / bandwidth (secondary context)
   * workingset_refault_file_delta per phase per cgroup (from memstat/)
-  * dirty-page pressure (from dirty/ — [TODO-3] vmstat + file_dirty samples)
+  * dirty-page pressure (from dirty/ vmstat + file_dirty samples)
 
 Usage: ./benchmark_analysis.py <results_dir>
 """
