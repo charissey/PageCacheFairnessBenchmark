@@ -53,6 +53,7 @@ penalty beyond what memory sizing alone can fix — the core result.
 | `cgroup_shared.ini` | Shared-pool cgroup layout (2G parent cap; both tenants under it). |
 | `cgroup_isolated.ini` | Isolated layout (separate per-tenant cgroups; `memory.low` optional — commented out by default). |
 | `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup). |
+| `setup_test_files.sh` | One-time creation of dense `test_file_1G` / `test_file_8G` (reuse across runs). |
 | `Makefile` | Build + convenience run targets. |
 | `benchmark_analysis.py` | Reads a results dir and prints p99, refault deltas, dirty-page peaks, PSI stalls. |
 | `benchmark_results/` | Output (created on first run). |
@@ -92,9 +93,11 @@ top-to-bottom:
 7. **fio command builder** — `build_fio_cmd()` turns a `PhaseConfig` into an
    `fio` command line, including `--output-format=json+` so the JSON contains
    `clat_ns.percentile` (p99/p999).
-8. **Test-file management** — `ensure_test_file()` pre-creates each tenant's
-   file with `fio --create_only` if missing; `drop_caches()` flushes the page
-   cache before each cached-mode phase.
+8. **Test-file management** — size-tagged paths (`test_file_1G`,
+   `test_file_8G`). Prefer `./setup_test_files.sh` (or `make setup-files`)
+   once; `ensure_test_file()` lazily fills missing/wrong-sized files with
+   real writes (not `--create_only`). `drop_caches()` flushes the page cache
+   before each cached-mode phase.
 9. **Run orchestration** — `run_clients()` pre-creates files, starts the
    sampler + iostat, then for each phase: drops caches, takes a "before"
    memstat snapshot, forks all clients' fio for that phase concurrently
@@ -163,7 +166,8 @@ cat /proc/pressure/memory
 ```
 
 Also ensure enough disk: default test files are 1G + 8G (~9 GB); Case 4 uses a
-48G file. `df -h .` before running.
+48G file. `df -h .` before running. Create them once with
+`make setup-files` (or `./setup_test_files.sh 1G 8G 48G`).
 
 ### cgroup pre-flight check
 
@@ -179,6 +183,7 @@ sudo ./check_cgroups.sh --cgroup-config cgroup_isolated.ini
 
 ```bash
 make            # produces ./benchmark
+make setup-files  # dense test_file_1G + test_file_8G (once, ~9 GB)
 make clean      # remove the binary
 ```
 

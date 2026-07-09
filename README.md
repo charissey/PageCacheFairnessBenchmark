@@ -46,7 +46,8 @@ pagecachefairnessbenchmark/
 │   ├── iostat/                    # iostat -x logs
 │   ├── psi/                       # Per-cgroup PSI time series (CSV)
 │   └── memstat/                   # Per-cgroup memory.stat snapshots (CSV)
-├── test_file_*                    # Generated test files (size-tagged)
+├── setup_test_files.sh            # One-time dense test_file_1G / test_file_8G
+├── test_file_*                    # Reused size-tagged files (test_file_1G, …)
 └── README.md                      # Research thesis and experiment plan
 ```
 
@@ -73,6 +74,15 @@ sudo apt-get install fio gcc make sysstat
 ```bash
 make
 ```
+
+### Create test files (once)
+```bash
+# Dense test_file_1G + test_file_8G (~9 GB). Reused across all experiments.
+make setup-files
+# Or: ./setup_test_files.sh 1G 8G 48G   # add Case 4 size when needed
+```
+The harness also creates a missing/wrong-sized file on first use, but
+pre-creating avoids paying fill cost inside a timed run.
 
 ## 📊 Workload Design
 
@@ -418,10 +428,11 @@ make clean
 ### Available Make Targets
 - `make` or `make all`: Build the benchmark
 - `make clean`: Remove build artifacts
+- `make setup-files`: Create dense `test_file_1G` / `test_file_8G` (once)
 - `make test`: Run a single workload test
 - `make run-all`: Run all workloads (`./benchmark all`)
 - `make analyze`: Analyze existing results
-- `make workflow`: Complete build, test, analyze workflow
+- `make workflow`: Build, ensure files, dual run, analyze
 
 ## 🔧 Advanced Usage
 
@@ -467,6 +478,7 @@ The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Expe
 | `cgroup_isolated.ini` | Per-tenant cgroups; optional `memory.low` (commented out by default) |
 | `cgroup_shared.ini` | Shared 2G parent pool; nested tenant cgroups |
 | `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup) |
+| `setup_test_files.sh` | One-time dense `test_file_1G` / `test_file_8G` (`make setup-files`) |
 | `benchmark_analysis.py` | Summarize fio p99, refault deltas, dirty/vmstat peaks, PSI |
 | `benchmark_results/` | Default output directory (`-o` overrides) |
 
@@ -475,7 +487,7 @@ The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Expe
 - **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `-v`
 - **Modes:** `dual` (`client1_steady` + `client2_noisy`), single workload name, `all`
 - **Cache:** `drop_caches()` before each cached phase; fio `direct=0` (cached) or `direct=1` (bypass)
-- **Test files:** pre-created with `fio --create_only` (`test_file_<client>_<size>`)
+- **Test files:** size-tagged dense files (`test_file_1G`, `test_file_8G`) via `./setup_test_files.sh` or lazy fill in the harness; reused across experiments
 - **Concurrency:** all clients in a phase forked together; phases run sequentially
 - **fio output:** one JSON per client per phase (`*_pN.json`) with `clat_ns.percentile` (p99/p999)
 

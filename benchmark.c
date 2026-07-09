@@ -623,11 +623,11 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
     if (p->rwmixread >= 0 && strstr(p->pattern, "rw"))
         append(cmd, cap, " --rwmixread=%d", p->rwmixread);
 
-    /* [TODO-1] victim access-distribution skew (zipf/pareto/normal) */
+    /* victim access-distribution skew (zipf/pareto/normal) */
     if (p->random_distribution[0])
         append(cmd, cap, " --random_distribution=%s", p->random_distribution);
 
-    /* [TODO-2] flush cadence — checkpoint / WAL dirtying.
+    /* flush cadence — checkpoint / WAL dirtying.
      * fdatasync=N issues fdatasync() every N write ops; fsync=N likewise. */
     if (p->fdatasync > 0) append(cmd, cap, " --fdatasync=%d", p->fdatasync);
     if (p->fsync     > 0) append(cmd, cap, " --fsync=%d",     p->fsync);
@@ -640,25 +640,62 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
  * Test-file management
  * ------------------------------------------------------------------ */
 
+/* Size-tagged path shared across clients with the same file_size, e.g.
+ * test_file_1G / test_file_8G. Created once (setup_test_files.sh or lazy
+ * fill below) and reused across experiments. */
 static void test_file_for(const ClientConfig *c, char *out, size_t n) {
-    snprintf(out, n, "test_file_%s_%s", c->name, c->file_size);
+    snprintf(out, n, "test_file_%s", c->file_size);
 }
 
-/* Pre-create a client's test file with fio --create_only if it is missing or
- * the wrong size. Doing this up front keeps the timed phases from paying file
- * layout cost and keeps refault accounting clean. */
+/* Parse fio-style sizes (e.g. 512M, 1G, 8G) into bytes. Returns 0 on failure. */
+static unsigned long long parse_size_bytes(const char *s) {
+    char *end = NULL;
+    unsigned long long n = strtoull(s, &end, 10);
+    if (end == s) return 0;
+    switch (*end) {
+        case 'k': case 'K': return n << 10;
+        case 'm': case 'M': return n << 20;
+        case 'g': case 'G': return n << 30;
+        case 't': case 'T': return n << 40;
+        case '\0':          return n;
+        default:            return 0;
+    }
+}
+
+/* Ensure a dense, size-correct test file exists. Prefer running
+ * ./setup_test_files.sh once; this is a lazy fallback that fills with real
+ * writes (not --create_only) so the file is cacheable and not sparse. */
 static void ensure_test_file(const ClientConfig *c) {
     char file[MAX_STR];
     test_file_for(c, file, sizeof(file));
-    if (access(file, F_OK) == 0) { VLOG("test file %s exists", file); return; }
-    INFO("creating test file %s (%s)...", file, c->file_size);
+
+    unsigned long long want = parse_size_bytes(c->file_size);
+    if (access(file, F_OK) == 0) {
+        struct stat st;
+        if (stat(file, &st) == 0 && want > 0 &&
+            (unsigned long long)st.st_size == want) {
+            VLOG("test file %s exists (%s)", file, c->file_size);
+            return;
+        }
+        if (stat(file, &st) == 0)
+            INFO("test file %s has wrong size (%lld vs %s); recreating...",
+                 file, (long long)st.st_size, c->file_size);
+        else
+            INFO("recreating test file %s (%s)...", file, c->file_size);
+        unlink(file);
+    } else {
+        INFO("creating test file %s (%s) with random data "
+             "(or run ./setup_test_files.sh once)...", file, c->file_size);
+    }
+
     char cmd[MAX_CMD];
     snprintf(cmd, sizeof(cmd),
-             "fio --name=create_%s --filename=%s --size=%s --rw=write --bs=1M "
-             "--create_only=1 --ioengine=libaio --direct=1 > /dev/null 2>&1",
-             c->name, file, c->file_size);
+             "fio --name=fill_%s --filename=%s --size=%s --rw=write --bs=1M "
+             "--ioengine=libaio --direct=1 --buffer_compress_percentage=0 "
+             "> /dev/null 2>&1",
+             c->file_size, file, c->file_size);
     if (system(cmd) != 0)
-        INFO("warning: could not pre-create %s (fio installed?)", file);
+        INFO("warning: could not create %s (fio installed? disk space?)", file);
 }
 
 /* Drop the page cache before a cached-mode phase so refaults are meaningful. */
@@ -752,7 +789,7 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         if (c && c->num_phases > max_phases) max_phases = c->num_phases;
     }
 
-    /* pre-create every client's test file (fio --create_only) */
+    /* ensure size-tagged test files exist (reuse test_file_<size> across runs) */
     for (int i = 0; i < n_clients; i++) {
         ClientConfig *c = find_client(cfg, client_names[i]);
         if (c) ensure_test_file(c);
