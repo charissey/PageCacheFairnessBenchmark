@@ -40,6 +40,8 @@ pagecachefairnessbenchmark/
 ├── benchmark.c                    # C benchmark implementation
 ├── benchmark                      # Compiled C binary
 ├── Makefile                       # Build configuration
+├── Dockerfile                     # Ubuntu image with fio + build deps
+├── .dockerignore                  # Keep test files / results out of the image
 ├── benchmark_analysis.py          # Results analysis (fio + PSI + refaults)
 ├── benchmark_results/             # Test results directory
 │   ├── *.json                     # Raw fio output (per phase)
@@ -83,6 +85,77 @@ make setup-files
 ```
 The harness also creates a missing/wrong-sized file on first use, but
 pre-creating avoids paying fill cost inside a timed run.
+
+### Running with Docker
+
+The benchmark needs Linux **cgroup v2**, writable `/sys/fs/cgroup`, and
+`/proc/sys/vm/drop_caches`. Use a privileged container with the host cgroup
+namespace so nested cgroup setup matches `check_cgroups.sh`.
+
+```bash
+# Build the image (does not bake in multi-GB test files)
+docker build -t pagecache-bench .
+
+# Interactive shell — preferred while iterating on cases
+docker run --rm -it --privileged --cgroupns=host \
+  -v "$PWD:/bench" \
+  -w /bench \
+  pagecache-bench bash
+```
+
+Inside the container (root is enough; no `sudo`):
+
+```bash
+make                                    # rebuild if you bind-mounted the repo
+./check_cgroups.sh --cgroup-config cgroup_shared.ini
+./setup_test_files.sh 1G 8G             # once; ~9 GB on the bind mount
+./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+./benchmark_analysis.py benchmark_results/
+```
+
+One-shot dual run (results land on the host via the bind mount):
+
+```bash
+docker run --rm --privileged --cgroupns=host \
+  -v "$PWD:/bench" -w /bench \
+  pagecache-bench \
+  ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+```
+
+On first run, every `memory.low`/`io.weight` write failed with `Permission 
+denied`, and `cgroup.subtree_control` write failed with `Device or resource 
+busy`.
+
+Cause: the container's own shell (and PID 1) live *directly* in the
+container's root cgroup (`/sys/fs/cgroup/cgroup.procs`). cgroup v2 enforces
+a "no internal processes" rule — a cgroup can't both hold processes itself
+*and* delegate controllers to children. Since our shell sits at the root,
+the root can't enable `+memory +io` for its children until the shell is
+moved out.
+
+Fix — move the current shell into its own leaf cgroup first, then enable
+controllers:
+
+```bash
+mkdir -p /sys/fs/cgroup/init
+echo $$ > /sys/fs/cgroup/init/cgroup.procs
+echo "+memory +io" > /sys/fs/cgroup/cgroup.subtree_control
+```
+
+Verified output after this:
+```
+$ cat /sys/fs/cgroup/cgroup.subtree_control
+io memory
+```
+
+**Notes**
+- Bind-mount the repo (`-v "$PWD:/bench"`) so `test_file_*` and
+  `benchmark_results/` persist on the host and survive container restarts.
+- On **Docker Desktop (macOS/Windows)** the container runs in a Linux VM; you
+  measure that VM’s page cache, not the Mac/Windows host. Prefer a native
+  Linux host or VM for paper-quality I/O numbers.
+- If `check_cgroups.sh` fails, confirm you passed both `--privileged` and
+  `--cgroupns=host`.
 
 ## 📊 Workload Design
 

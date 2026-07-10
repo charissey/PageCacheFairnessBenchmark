@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <time.h>
 
 #define MAX_PHASES        16
@@ -341,6 +342,122 @@ static void enable_controllers(const char *cg_path) {
     else VLOG("enabled +memory +io in %s", p);
 }
 
+/* Count '/' separators so we can destroy deepest leaves before parents. */
+static int cgroup_rel_depth(const char *rel) {
+    int d = 0;
+    for (const char *p = rel; *p; p++)
+        if (*p == '/') d++;
+    return d;
+}
+
+/* Move every member of cg_path into its parent cgroup so rmdir can succeed. */
+static void evacuate_cgroup_procs(const char *cg_path) {
+    char procs_path[MAX_CMD], parent[MAX_CMD], parent_procs[MAX_CMD];
+    if (snprintf(procs_path, sizeof(procs_path), "%s/cgroup.procs", cg_path) >= (int)sizeof(procs_path))
+        return;
+    if (snprintf(parent, sizeof(parent), "%s", cg_path) >= (int)sizeof(parent))
+        return;
+    char *slash = strrchr(parent, '/');
+    if (!slash || slash == parent) return; /* refuse to evacuate into / */
+    *slash = '\0';
+    if (snprintf(parent_procs, sizeof(parent_procs), "%s/cgroup.procs", parent) >= (int)sizeof(parent_procs))
+        return;
+
+    FILE *f = fopen(procs_path, "r");
+    if (!f) return;
+
+    int pids[256];
+    int n = 0;
+    int pid;
+    while (n < (int)(sizeof(pids) / sizeof(pids[0])) && fscanf(f, "%d", &pid) == 1)
+        pids[n++] = pid;
+    fclose(f);
+
+    for (int i = 0; i < n; i++) {
+        FILE *w = fopen(parent_procs, "w");
+        if (!w) {
+            INFO("warning: cannot move pid %d out of %s: %s", pids[i], cg_path, strerror(errno));
+            continue;
+        }
+        if (fprintf(w, "%d\n", pids[i]) < 0)
+            INFO("warning: move pid %d out of %s: %s", pids[i], cg_path, strerror(errno));
+        fclose(w);
+        VLOG("moved pid %d from %s -> %s", pids[i], cg_path, parent);
+    }
+}
+
+/* Recursively delete a cgroup directory (children first). Resets lifetime
+ * counters such as workingset_refault_file for the next run. */
+static bool remove_cgroup_recursive(const char *cg_path) {
+    struct stat st;
+    if (stat(cg_path, &st) != 0) {
+        if (errno == ENOENT) return true;
+        INFO("error: stat %s: %s", cg_path, strerror(errno));
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) return true;
+
+    DIR *d = opendir(cg_path);
+    if (!d) {
+        INFO("error: opendir %s: %s", cg_path, strerror(errno));
+        return false;
+    }
+    struct dirent *ent;
+    bool ok = true;
+    while ((ent = readdir(d)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        char child[MAX_CMD];
+        if (snprintf(child, sizeof(child), "%s/%s", cg_path, ent->d_name) >= (int)sizeof(child)) {
+            INFO("error: path too long under %s", cg_path);
+            ok = false;
+            break;
+        }
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (!remove_cgroup_recursive(child)) ok = false;
+        }
+    }
+    closedir(d);
+    if (!ok) return false;
+
+    evacuate_cgroup_procs(cg_path);
+    if (rmdir(cg_path) != 0) {
+        if (errno == ENOENT) return true;
+        INFO("error: rmdir %s: %s (is a process still in this cgroup?)", cg_path, strerror(errno));
+        return false;
+    }
+    INFO("removed stale cgroup %s", cg_path);
+    return true;
+}
+
+/* Tear down configured cgroups (deepest first) so the next create starts with
+ * fresh memory.stat counters. */
+static bool destroy_cgroups(const CgroupSet *set) {
+    int order[MAX_CGROUPS];
+    for (int i = 0; i < set->n; i++) order[i] = i;
+    /* deepest relative paths first */
+    for (int i = 0; i < set->n; i++) {
+        for (int j = i + 1; j < set->n; j++) {
+            if (cgroup_rel_depth(set->groups[order[j]].cgroup_name) >
+                cgroup_rel_depth(set->groups[order[i]].cgroup_name)) {
+                int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+            }
+        }
+    }
+
+    bool ok = true;
+    for (int k = 0; k < set->n; k++) {
+        const CgroupConfig *g = &set->groups[order[k]];
+        char path[MAX_CMD];
+        if (snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, g->cgroup_name) >= (int)sizeof(path)) {
+            INFO("error: cgroup path too long: %s/%s", CGROUP_ROOT, g->cgroup_name);
+            ok = false;
+            continue;
+        }
+        if (!remove_cgroup_recursive(path)) ok = false;
+    }
+    return ok;
+}
+
 /* mkdir -p for a cgroup path under CGROUP_ROOT, enabling controllers on each
  * intermediate directory top-down (a controller can only be delegated by a
  * parent that already has it). `rel` is the path relative to CGROUP_ROOT. */
@@ -366,9 +483,18 @@ static void mkdir_p_cgroup(const char *rel) {
     }
 }
 
-/* Create the cgroups (with intermediates) and apply limits. */
-static void setup_cgroups(const CgroupSet *set) {
-    if (!is_linux()) { INFO("note: not Linux — skipping cgroup setup"); return; }
+/* Destroy any leftover cgroups from prior runs, then recreate and apply limits.
+ * Fresh cgroup directories reset lifetime counters (e.g. workingset_refault_file). */
+static bool setup_cgroups(const CgroupSet *set) {
+    if (!is_linux()) { INFO("note: not Linux — skipping cgroup setup"); return true; }
+
+    INFO("resetting cgroups from config (delete + recreate to clear stale counters)");
+    if (!destroy_cgroups(set)) {
+        INFO("error: failed to remove stale cgroups — kill leftover fio/benchmark "
+             "processes and retry");
+        return false;
+    }
+
     for (int i = 0; i < set->n; i++) {
         const CgroupConfig *g = &set->groups[i];
         mkdir_p_cgroup(g->cgroup_name);
@@ -378,6 +504,7 @@ static void setup_cgroups(const CgroupSet *set) {
         write_cgroup_file(path, "memory.low", g->memory_low);
         write_cgroup_file(path, "io.weight",  g->io_weight);
     }
+    return true;
 }
 
 static const CgroupConfig *cgroup_for_client(const CgroupSet *set, const char *client) {
@@ -404,12 +531,28 @@ static long read_memstat_field(const char *cgroup_name, const char *field) {
     return found;
 }
 
+/* Read a single-integer cgroup control file, e.g. memory.current. */
+static long read_cgroup_scalar(const char *cgroup_name, const char *filename) {
+    if (!is_linux()) return -1;
+    char p[MAX_CMD];
+    snprintf(p, sizeof(p), "%s/%s/%s", CGROUP_ROOT, cgroup_name, filename);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    long val;
+    long found = (fscanf(f, "%ld", &val) == 1) ? val : -1;
+    fclose(f);
+    return found;
+}
+
 /* Append a before/after memstat row to memstat/<client>_<mode>.csv */
 static void record_memstat(const char *cgroup_name, const char *client,
                            const char *mode, int phase, const char *when,
-                           long prev_refault, long *out_refault) {
+                           long prev_refault, long *out_refault,
+                           long prev_memcur, long *out_memcur) {
     long refault = read_memstat_field(cgroup_name, "workingset_refault_file");
     if (out_refault) *out_refault = refault;
+    long memcur = read_cgroup_scalar(cgroup_name, "memory.current");
+    if (out_memcur) *out_memcur = memcur;
 
     char dir[MAX_CMD], path[MAX_CMD];
     ensure_subdir(opt.output_dir, "memstat", dir, sizeof(dir));
@@ -419,10 +562,15 @@ static void record_memstat(const char *cgroup_name, const char *client,
     FILE *f = fopen(path, "a");
     if (!f) { INFO("warning: memstat csv %s: %s", path, strerror(errno)); return; }
     if (!exists)
-        fprintf(f, "phase,when,workingset_refault_file,workingset_refault_file_delta\n");
+        fprintf(f, "phase,when,wall_time,workingset_refault_file,"
+                   "workingset_refault_file_delta,memory_current_bytes,"
+                   "memory_current_bytes_delta\n");
     long delta = (when && !strcmp(when, "after") && prev_refault >= 0 && refault >= 0)
                      ? refault - prev_refault : -1;
-    fprintf(f, "%d,%s,%ld,%ld\n", phase, when, refault, delta);
+    long memdelta = (when && !strcmp(when, "after") && prev_memcur >= 0 && memcur >= 0)
+                     ? memcur - prev_memcur : -1;
+    fprintf(f, "%d,%s,%ld,%ld,%ld,%ld,%ld\n",
+            phase, when, (long)time(NULL), refault, delta, memcur, memdelta);
     fclose(f);
 }
 
@@ -565,6 +713,16 @@ static pid_t start_iostat(const char *mode) {
     char dir[MAX_CMD], path[MAX_CMD], cmd[MAX_CMD];
     ensure_subdir(opt.output_dir, "iostat", dir, sizeof(dir));
     snprintf(path, sizeof(path), "%s/run_%s.iostat", dir, mode);
+
+    /* Record iostat's own start time so analysis can map each 1s report
+     * (report 0 is the since-boot average; reports 1..N are the 1s
+     * intervals) back to a wall-clock time and line it up against the
+     * per-phase before/after wall_time in memstat CSV files. */
+    char ts_path[MAX_CMD];
+    snprintf(ts_path, sizeof(ts_path), "%s/run_%s.start_ts", dir, mode);
+    FILE *tf = fopen(ts_path, "w");
+    if (tf) { fprintf(tf, "%ld\n", (long)time(NULL)); fclose(tf); }
+
     /* iostat -dx 1 : extended device stats every second, redirected to file */
     snprintf(cmd, sizeof(cmd), "exec iostat -dx 1 > '%s' 2>/dev/null", path);
 
@@ -623,11 +781,11 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
     if (p->rwmixread >= 0 && strstr(p->pattern, "rw"))
         append(cmd, cap, " --rwmixread=%d", p->rwmixread);
 
-    /* victim access-distribution skew (zipf/pareto/normal) */
+    /* [TODO-1] victim access-distribution skew (zipf/pareto/normal) */
     if (p->random_distribution[0])
         append(cmd, cap, " --random_distribution=%s", p->random_distribution);
 
-    /* flush cadence — checkpoint / WAL dirtying.
+    /* [TODO-2] flush cadence — checkpoint / WAL dirtying.
      * fdatasync=N issues fdatasync() every N write ops; fsync=N likewise. */
     if (p->fdatasync > 0) append(cmd, cap, " --fdatasync=%d", p->fdatasync);
     if (p->fsync     > 0) append(cmd, cap, " --fsync=%d",     p->fsync);
@@ -640,62 +798,25 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
  * Test-file management
  * ------------------------------------------------------------------ */
 
-/* Size-tagged path shared across clients with the same file_size, e.g.
- * test_file_1G / test_file_8G. Created once (setup_test_files.sh or lazy
- * fill below) and reused across experiments. */
 static void test_file_for(const ClientConfig *c, char *out, size_t n) {
-    snprintf(out, n, "test_file_%s", c->file_size);
+    snprintf(out, n, "test_file_%s_%s", c->name, c->file_size);
 }
 
-/* Parse fio-style sizes (e.g. 512M, 1G, 8G) into bytes. Returns 0 on failure. */
-static unsigned long long parse_size_bytes(const char *s) {
-    char *end = NULL;
-    unsigned long long n = strtoull(s, &end, 10);
-    if (end == s) return 0;
-    switch (*end) {
-        case 'k': case 'K': return n << 10;
-        case 'm': case 'M': return n << 20;
-        case 'g': case 'G': return n << 30;
-        case 't': case 'T': return n << 40;
-        case '\0':          return n;
-        default:            return 0;
-    }
-}
-
-/* Ensure a dense, size-correct test file exists. Prefer running
- * ./setup_test_files.sh once; this is a lazy fallback that fills with real
- * writes (not --create_only) so the file is cacheable and not sparse. */
+/* Pre-create a client's test file with fio --create_only if it is missing or
+ * the wrong size. Doing this up front keeps the timed phases from paying file
+ * layout cost and keeps refault accounting clean. */
 static void ensure_test_file(const ClientConfig *c) {
     char file[MAX_STR];
     test_file_for(c, file, sizeof(file));
-
-    unsigned long long want = parse_size_bytes(c->file_size);
-    if (access(file, F_OK) == 0) {
-        struct stat st;
-        if (stat(file, &st) == 0 && want > 0 &&
-            (unsigned long long)st.st_size == want) {
-            VLOG("test file %s exists (%s)", file, c->file_size);
-            return;
-        }
-        if (stat(file, &st) == 0)
-            INFO("test file %s has wrong size (%lld vs %s); recreating...",
-                 file, (long long)st.st_size, c->file_size);
-        else
-            INFO("recreating test file %s (%s)...", file, c->file_size);
-        unlink(file);
-    } else {
-        INFO("creating test file %s (%s) with random data "
-             "(or run ./setup_test_files.sh once)...", file, c->file_size);
-    }
-
+    if (access(file, F_OK) == 0) { VLOG("test file %s exists", file); return; }
+    INFO("creating test file %s (%s)...", file, c->file_size);
     char cmd[MAX_CMD];
     snprintf(cmd, sizeof(cmd),
-             "fio --name=fill_%s --filename=%s --size=%s --rw=write --bs=1M "
-             "--ioengine=libaio --direct=1 --buffer_compress_percentage=0 "
-             "> /dev/null 2>&1",
-             c->file_size, file, c->file_size);
+             "fio --name=create_%s --filename=%s --size=%s --rw=write --bs=1M "
+             "--create_only=1 --ioengine=libaio --direct=1 > /dev/null 2>&1",
+             c->name, file, c->file_size);
     if (system(cmd) != 0)
-        INFO("warning: could not create %s (fio installed? disk space?)", file);
+        INFO("warning: could not pre-create %s (fio installed?)", file);
 }
 
 /* Drop the page cache before a cached-mode phase so refaults are meaningful. */
@@ -782,20 +903,18 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
     }
 
     /* max phase count across clients */
-    /* in current implementation, we only run one phase */
     int max_phases = 1;
     for (int i = 0; i < n_clients; i++) {
         ClientConfig *c = find_client(cfg, client_names[i]);
         if (c && c->num_phases > max_phases) max_phases = c->num_phases;
     }
 
-    /* ensure size-tagged test files exist (reuse test_file_<size> across runs) */
+    /* pre-create every client's test file (fio --create_only) */
     for (int i = 0; i < n_clients; i++) {
         ClientConfig *c = find_client(cfg, client_names[i]);
         if (c) ensure_test_file(c);
     }
 
-    /* fork child processes to get stats */
     pid_t sampler = start_sampler(mode_str, cg_names, n_cg);
     pid_t iostat  = start_iostat(mode_str);
 
@@ -807,11 +926,13 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         /* refaults are a running total of page faults that have occurred per cgroup created */
         /* if we use /sys/fs/cgroup/clients/client1_steady across multiple benchmark runs, the counter keeps climbing */
         long prev_refault[MAX_CLIENTS];
+        long prev_memcur[MAX_CLIENTS];
         for (int i = 0; i < n_clients; i++) {
             prev_refault[i] = -1;
+            prev_memcur[i] = -1;
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
             if (g) record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "before",
-                                  -1, &prev_refault[i]);
+                                  -1, &prev_refault[i], -1, &prev_memcur[i]);
         }
 
         /* spawn all clients' phase-ph concurrently */
@@ -836,9 +957,8 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         /* after-snapshot -> computes workingset_refault_file_delta */
         for (int i = 0; i < n_clients; i++) {
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
-            
             if (g) record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "after",
-                                  prev_refault[i], NULL);
+                                  prev_refault[i], NULL, prev_memcur[i], NULL);
         }
     }
 
@@ -929,7 +1049,7 @@ int main(int argc, char **argv) {
     CgroupSet cgset; bool have_cgset = false;
     if (opt.use_cgroups && opt.cgroup_config_path) {
         if (!parse_cgroup_config(opt.cgroup_config_path, &cgset)) return 1;
-        setup_cgroups(&cgset);
+        if (!setup_cgroups(&cgset)) return 1;
         have_cgset = true;
     }
     const CgroupSet *cgptr = have_cgset ? &cgset : NULL;

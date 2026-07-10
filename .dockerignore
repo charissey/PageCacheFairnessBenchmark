@@ -1,0 +1,20 @@
+# Build artifacts
+benchmark
+*.o
+
+# Large / generated data — mount at runtime instead
+test_file_*
+benchmark_results/
+results/
+
+# VCS / IDE
+.git/
+.idea/
+cmake-build-*/
+CMakeLists.txt
+library.c
+library.h
+.DS_Store
+
+# Docs not needed in the image (README is host-side)
+*.md
