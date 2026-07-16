@@ -225,18 +225,9 @@ before it.
 |---|---|---|---|---|---|
 | 1 | Isolated Baselines | Each client **alone** | n/a (no sharing) | — (reference point) | Standalone p99 / throughput per client; the baseline all deltas subtract from |
 | 2 | Isolated Clients | Concurrent | `cgroup_isolated.ini` (separate per-tenant cgroups) | +concurrency, **with** isolation | Whether separate cgroups keep p99 ≈ baseline when both run together |
-| 3 | Shared Sequential | Concurrent | **no memory limits** (`--no-cgroup`) | remove cgroup memory limits (shared pool) | Raw interference with nothing protecting A |
-| 4 | Shared Client 2 Random Read | Concurrent | shared, parent `memory.max = 512M` | B → 48G file, `randread`, under tiny shared cap | Heavy eviction pressure: B's working set ≫ cache |
-| 5 | Shared Client 1 Limited | Concurrent | shared, `client1_steady memory.max = 1G` | cap the **victim's** memory | Whether limiting A (not B) helps or hurts A's p99 |
-| 6 | Shared Client 2 Limited | Concurrent | shared, `client2_noisy memory.max = 1G` | cap the **aggressor's** memory | The standard mitigation: does capping B bound A's p99? |
-
-**How to read the progression:**
-- **1 → 2:** adds concurrency but keeps isolation → expect A's p99 stays near baseline.
-- **2 → 3:** removes the memory limits → expect A's p99 to spike (interference).
-- **3 → 4:** makes B a cache-thrashing random reader under a 512M cap → expect
-  maximal eviction of A and large `workingset_refault_file_delta` for A.
-- **3 → 5** and **3 → 6:** each caps exactly one tenant → compares "limit the
-  victim" vs "limit the noisy neighbor" as isolation strategies.
+| 3 | Shared Client 2 Random Read | Concurrent | shared, parent `memory.max = 512M` | B → 48G file, `randread`, under tiny shared cap | Heavy eviction pressure: B's working set ≫ cache |
+| 4 | Shared Client 1 Limited | Concurrent | shared, `client1_steady memory.max = 1G` | cap the **victim's** memory | Whether limiting A (not B) helps or hurts A's p99 |
+| 5 | Shared Client 2 Limited | Concurrent | shared, `client2_noisy memory.max = 1G` | cap the **aggressor's** memory | The standard mitigation: does capping B bound A's p99? |
 
 ### Running each case
 
@@ -248,27 +239,19 @@ before it.
 # Case 2 — Isolated Clients (concurrent, isolated cgroups)
 sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached dual
 
-# Case 3 — Shared Sequential (concurrent, no memory limits)
-sudo ./benchmark --no-cgroup -m cached dual
-
-# Cases 4–6 — Shared with one cap changed (edit the cgroup .ini, then run)
+# Cases 3-5 — Shared with one cap changed (edit the cgroup .ini, then run)
 sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
 ```
 
-For Cases 4–6, change the single `memory.max` line in the cgroup config (keep
+For Cases 3-5, change the single `memory.max` line in the cgroup config (keep
 everything else identical to Case 3's shared layout):
 
 ```ini
-# Case 4 — parent (shared) cap = 512M, and set client2_noisy file_size = 48G
-[clients]
-cgroup_name = clients
-memory.max = 512M
-
-# Case 5 — cap only the victim
+# Case 4 — cap only the victim
 [client1_steady]
 memory.max = 1G
 
-# Case 6 — cap only the aggressor
+# Case 5 — cap only the aggressor
 [client2_noisy]
 memory.max = 1G
 ```

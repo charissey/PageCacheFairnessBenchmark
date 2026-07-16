@@ -51,6 +51,10 @@ typedef struct {
     int   runtime;                    /* seconds                             */
     int   rwmixread;                  /* for randrw; -1 = unset              */
 
+    /* read a fixed amount then stop (not time_based); "" = unset */
+    char  io_size[MAX_STR];           /* e.g. 1G -> fio --io_size            */
+    char  rate_bw[MAX_STR];           /* bandwidth cap e.g. 100m -> --rate   */
+
     /* victim access-distribution skew */
     char  random_distribution[MAX_STR]; /* "" or e.g. "zipf:1.2"             */
 
@@ -190,6 +194,8 @@ static void apply_phase_key(PhaseConfig *p, const char *key, const char *val) {
     else if (!strcmp(key, "numjobs"))             p->numjobs   = atoi(val);
     else if (!strcmp(key, "runtime"))             p->runtime   = atoi(val);
     else if (!strcmp(key, "rwmixread"))           p->rwmixread = atoi(val);
+    else if (!strcmp(key, "io_size"))             snprintf(p->io_size, MAX_STR, "%s", val);
+    else if (!strcmp(key, "rate_bw"))             snprintf(p->rate_bw, MAX_STR, "%s", val);
     /* victim access-distribution skew */
     else if (!strcmp(key, "random_distribution")) snprintf(p->random_distribution, MAX_STR, "%s", val);
     /* flush cadence for checkpoint / WAL B variants */
@@ -775,19 +781,29 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
     append(cmd, cap, " --ioengine=%s", p->ioengine);
     append(cmd, cap, " --iodepth=%d", p->iodepth);
     append(cmd, cap, " --numjobs=%d", p->numjobs);
-    append(cmd, cap, " --runtime=%d --time_based", p->runtime);
+    if (p->io_size[0]) {
+        /* read a fixed amount once then stop; runtime (if set) is a ceiling */
+        append(cmd, cap, " --io_size=%s", p->io_size);
+        if (p->runtime > 0) append(cmd, cap, " --runtime=%d", p->runtime);
+    } else {
+        /* read for a fixed time */
+        append(cmd, cap, " --runtime=%d --time_based", p->runtime);
+    }
     append(cmd, cap, " --direct=%d", cached ? 0 : 1);
     append(cmd, cap, " --group_reporting");
 
+    /* bandwidth cap */
+    if (p->rate_bw[0])    append(cmd, cap, " --rate=%s", p->rate_bw);
+    /* IOPS cap */
     if (p->rate_iops > 0) append(cmd, cap, " --rate_iops=%d", p->rate_iops);
     if (p->rwmixread >= 0 && strstr(p->pattern, "rw"))
         append(cmd, cap, " --rwmixread=%d", p->rwmixread);
 
-    /* [TODO-1] victim access-distribution skew (zipf/pareto/normal) */
+    /* victim access-distribution skew (zipf/pareto/normal) */
     if (p->random_distribution[0])
         append(cmd, cap, " --random_distribution=%s", p->random_distribution);
 
-    /* [TODO-2] flush cadence — checkpoint / WAL dirtying.
+    /* flush cadence — checkpoint / WAL dirtying.
      * fdatasync=N issues fdatasync() every N write ops; fsync=N likewise. */
     if (p->fdatasync > 0) append(cmd, cap, " --fdatasync=%d", p->fdatasync);
     if (p->fsync     > 0) append(cmd, cap, " --fsync=%d",     p->fsync);
