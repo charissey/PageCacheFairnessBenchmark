@@ -94,6 +94,7 @@ static struct {
     bool        verbose;
     bool        use_cgroups;
     bool        use_psi;
+    bool        drop_once;         /* drop page cache before phase 0 only, then let it persist */
 } opt = {
     .config_path        = "fairness_configs.ini",
     .cgroup_config_path = NULL,
@@ -102,6 +103,7 @@ static struct {
     .verbose            = false,
     .use_cgroups        = true,
     .use_psi            = true,
+    .drop_once          = false,
 };
 
 #define VLOG(...) do { if (opt.verbose) { fprintf(stderr, "[v] " __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -920,7 +922,10 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
 
     for (int ph = 0; ph < max_phases; ph++) {
         INFO("--- phase %d ---", ph);
-        if (cached) drop_caches();
+        /* --drop-once: only clear the cache before phase 0 so B's reads can
+         * accumulate across phases 1..N and evict A's pages by the later
+         * phases, instead of every phase starting from a cold cache. */
+        if (cached && (!opt.drop_once || ph == 0)) drop_caches();
 
         /* before-snapshot of memory.stat (refaults) to calculate workingset_refault_file_delta */
         /* refaults are a running total of page faults that have occurred per cgroup created */
@@ -935,8 +940,8 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
                                   -1, &prev_refault[i], -1, &prev_memcur[i]);
         }
 
-        /* spawn all clients' phase-ph concurrently */
-        pid_t pids[MAX_CLIENTS]; // int npids = 0;
+        /* timed measurement: spawn all clients' phase-ph concurrently */
+        pid_t pids[MAX_CLIENTS];
         for (int i = 0; i < n_clients; i++) {
             ClientConfig *c = find_client(cfg, client_names[i]);
             if (!c || ph >= c->num_phases || !c->phases[ph].present) { pids[i] = -1; continue; }
@@ -946,7 +951,6 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
             /* fork+exec the client's phase in the background */
             /* returns the child process pid */
             pids[i] = spawn_client_phase(c, &c->phases[ph], mode_str, cached, cg);
-            // if (pids[i] > 0) npids++;
         }
 
         /* wait for all clients' phases to complete as they run concurrently */
@@ -1003,6 +1007,8 @@ static void usage(const char *argv0) {
 "      --cgroup-config PATH  cgroup layout ini (enables cgroup setup)\n"
 "      --no-cgroup          Disable cgroup setup (shared page-cache pool)\n"
 "      --no-psi             Disable PSI (memory/io.pressure) sampling\n"
+"      --drop-once          Cached mode: drop_caches before phase 0 only; cache\n"
+"                           persists across later phases (default: drop every phase)\n"
 "  -m, --mode MODE          cached | direct | both (default: both)\n"
 "  -o, --output DIR         Results directory (default: benchmark_results)\n"
 "  -v, --verbose            Verbose logging\n"
@@ -1011,6 +1017,8 @@ static void usage(const char *argv0) {
 "Notes:\n"
 "  * Writer-B (Mechanism 2) pairings MUST run with -m cached; direct=1 disables\n"
 "    dirty writeback and Mechanism 2 vanishes.\n"
+"  * --drop-once is for multi-phase eviction stories: A's hot set is warmed\n"
+"    once, then B's reads accumulate phase over phase and evict A from cache.\n"
 "  * cgroups / PSI / memory.stat / /proc/vmstat require Linux (cgroup v2).\n",
         argv0);
 }
@@ -1024,6 +1032,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) opt.verbose = true;
         else if (!strcmp(a, "--no-cgroup")) opt.use_cgroups = false;
         else if (!strcmp(a, "--no-psi")) opt.use_psi = false;
+        else if (!strcmp(a, "--drop-once")) opt.drop_once = true;
         else if ((!strcmp(a, "-c") || !strcmp(a, "--config")) && i + 1 < argc) opt.config_path = argv[++i];
         else if (!strcmp(a, "--cgroup-config") && i + 1 < argc) opt.cgroup_config_path = argv[++i];
         else if ((!strcmp(a, "-o") || !strcmp(a, "--output")) && i + 1 < argc) opt.output_dir = argv[++i];

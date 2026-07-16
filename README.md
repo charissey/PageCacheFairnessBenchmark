@@ -557,9 +557,9 @@ The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Expe
 
 ### Harness
 
-- **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `-v`
+- **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `--drop-once`, `-v`
 - **Modes:** `dual` (`client1_steady` + `client2_noisy`), single workload name, `all`
-- **Cache:** `drop_caches()` before each cached phase; fio `direct=0` (cached) or `direct=1` (bypass)
+- **Cache:** `drop_caches()` before each cached phase by default; fio `direct=0` (cached) or `direct=1` (bypass). Pass `--drop-once` to drop only before phase 0 and let the cache persist across later phases — needed for multi-phase eviction stories where B's reads must accumulate to evict A's pages over time.
 - **Test files:** size-tagged dense files (`test_file_1G`, `test_file_8G`) via `./setup_test_files.sh` or lazy fill in the harness; reused across experiments
 - **Concurrency:** all clients in a phase forked together; phases run sequentially
 - **fio output:** one JSON per client per phase (`*_pN.json`) with `clat_ns.percentile` (p99/p999)
