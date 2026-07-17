@@ -329,21 +329,6 @@ per cgroup, read from `memstat/`. This counts file-backed pages a tenant evicted
 and had to re-fault from disk during a phase — a direct measure of how much one
 tenant's activity churns another's cache.
 
-```
-## 🔁 WORKING SET REFAULTS (page-cache eviction churn)
-==================================================
-### CACHED mode
-
-**client1_steady:**
-  phase 2:          300 pages (     1.2 MiB)
-
-**client2_noisy:**
-  phase 2:       25,000 pages (    97.7 MiB)
-
-  Refault comparison (client1_steady vs client2_noisy):
-    phase 2: client1_steady=300  client2_noisy=25,000  → client2_noisy refaulted 83.3× more
-```
-
 ## 🔍 Key Metrics
 
 - **p99 / p999 read latency (μs)** — the objective; from fio `clat_ns.percentile`.
@@ -369,24 +354,42 @@ Multi-phase configuration format (phase-prefixed keys; matches checked-in defaul
 [client1_steady]                 ; Tenant A — the victim
 description = Hot-set sequential reader; report clat p99 (rate-limited SLO signal)
 file_size = 1G
-phase_0_pattern = read
-phase_0_block_size = 4k
-phase_0_rate_iops = 10000
-phase_0_iodepth = 1
-phase_0_numjobs = 1
-phase_0_runtime = 60
-phase_0_ioengine = libaio
+phase_n_pattern = read
+phase_n_block_size = 4k
+phase_n_rate_iops = 10000
+phase_n_iodepth = 1
+phase_n_numjobs = 1
+phase_n_runtime = 60
+phase_n_ioengine = libaio
 
-[client2_noisy]                 ; Tenant B — random read neighbor (Mechanism 1 default)
-description = Random buffered random reader (Mechanism 1)
+[client2_noisy]                 ; Tenant B — read neighbor (Mechanism 1 default)
+description = Aggressor: stream 8G file, ramp bandwidth 8m -> 100m -> unlimited to evict client1
 file_size = 8G
-phase_0_pattern = randread
-phase_0_block_size = 4k
-phase_0_rate_iops = 80000
+; --- phase 0: light (reads < 500MB) ---
+phase_0_pattern = read        ; sequential stream
+phase_0_block_size = 1M       ; big blocks = high bandwidth per I/O
+phase_0_rate_bw = 8m          ; 8 MiB/s × 60s ≈ 480 MB (< 500MB)
 phase_0_iodepth = 32
 phase_0_numjobs = 1
-phase_0_runtime = 60
+phase_0_runtime = 60          ; time_based (no io_size) → runs the full 60s
 phase_0_ioengine = libaio
+
+; --- phase 1: crank up (fills + overflows the 2G pool) ---
+phase_1_pattern = read
+phase_1_block_size = 1M
+phase_1_rate_bw = 100m        ; 100 MiB/s × 60s ≈ 6GB → overflows pool
+phase_1_iodepth = 32
+phase_1_numjobs = 1
+phase_1_runtime = 60
+phase_1_ioengine = libaio
+
+; --- phase 2: burst (unlimited; no rate_bw) → evicts everything ---
+phase_2_pattern = read
+phase_2_block_size = 1M
+phase_2_iodepth = 32
+phase_2_numjobs = 1
+phase_2_runtime = 60
+phase_2_ioengine = libaio
 ```
 
 > **Reminder:** run writer-B pairings with `-m cached`. In `direct` mode fio

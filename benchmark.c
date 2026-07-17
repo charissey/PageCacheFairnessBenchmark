@@ -552,11 +552,17 @@ static long read_cgroup_scalar(const char *cgroup_name, const char *filename) {
     return found;
 }
 
-/* Append a before/after memstat row to memstat/<client>_<mode>.csv */
+/* Append a before/after memstat row to memstat/<client>_<mode>.csv
+ *
+ *   prev_refault : previous phase-"before" absolute refault (for per-phase delta)
+ *   base_refault : run-start absolute refault (for cumulative total per phase);
+ *                  pass -1 to leave the total column as -1.
+ */
 static void record_memstat(const char *cgroup_name, const char *client,
                            const char *mode, int phase, const char *when,
                            long prev_refault, long *out_refault,
-                           long prev_memcur, long *out_memcur) {
+                           long prev_memcur, long *out_memcur,
+                           long base_refault) {
     long refault = read_memstat_field(cgroup_name, "workingset_refault_file");
     if (out_refault) *out_refault = refault;
     long memcur = read_cgroup_scalar(cgroup_name, "memory.current");
@@ -571,14 +577,17 @@ static void record_memstat(const char *cgroup_name, const char *client,
     if (!f) { INFO("warning: memstat csv %s: %s", path, strerror(errno)); return; }
     if (!exists)
         fprintf(f, "phase,when,wall_time,workingset_refault_file,"
-                   "workingset_refault_file_delta,memory_current_bytes,"
-                   "memory_current_bytes_delta\n");
+                   "workingset_refault_file_delta,workingset_refault_file_total,"
+                   "memory_current_bytes,memory_current_bytes_delta\n");
     long delta = (when && !strcmp(when, "after") && prev_refault >= 0 && refault >= 0)
                      ? refault - prev_refault : -1;
+    /* cumulative refaults for this run through this snapshot (>=0 only when a
+     * run-start baseline was captured and the counter is readable) */
+    long total = (base_refault >= 0 && refault >= 0) ? refault - base_refault : -1;
     long memdelta = (when && !strcmp(when, "after") && prev_memcur >= 0 && memcur >= 0)
                      ? memcur - prev_memcur : -1;
-    fprintf(f, "%d,%s,%ld,%ld,%ld,%ld,%ld\n",
-            phase, when, (long)time(NULL), refault, delta, memcur, memdelta);
+    fprintf(f, "%d,%s,%ld,%ld,%ld,%ld,%ld,%ld\n",
+            phase, when, (long)time(NULL), refault, delta, total, memcur, memdelta);
     fclose(f);
 }
 
@@ -936,6 +945,15 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
     pid_t sampler = start_sampler(mode_str, cg_names, n_cg);
     pid_t iostat  = start_iostat(mode_str);
 
+    /* run-start absolute refault per client; cgroups were just recreated so this
+     * is ~0. Used to report cumulative "total refaults per phase" (not just the
+     * per-phase delta). */
+    long base_refault[MAX_CLIENTS];
+    for (int i = 0; i < n_clients; i++) {
+        const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
+        base_refault[i] = g ? read_memstat_field(g->cgroup_name, "workingset_refault_file") : -1;
+    }
+
     for (int ph = 0; ph < max_phases; ph++) {
         INFO("--- phase %d ---", ph);
         /* --drop-once: only clear the cache before phase 0 so B's reads can
@@ -953,7 +971,7 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
             prev_memcur[i] = -1;
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
             if (g) record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "before",
-                                  -1, &prev_refault[i], -1, &prev_memcur[i]);
+                                  -1, &prev_refault[i], -1, &prev_memcur[i], base_refault[i]);
         }
 
         /* timed measurement: spawn all clients' phase-ph concurrently */
@@ -978,7 +996,7 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         for (int i = 0; i < n_clients; i++) {
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
             if (g) record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "after",
-                                  prev_refault[i], NULL, prev_memcur[i], NULL);
+                                  prev_refault[i], NULL, prev_memcur[i], NULL, base_refault[i]);
         }
     }
 

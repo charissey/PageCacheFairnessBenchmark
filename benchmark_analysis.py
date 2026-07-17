@@ -75,14 +75,20 @@ def report_refaults(results_dir):
         with open(path) as f:
             for row in csv.DictReader(f):
                 if row.get("when") == "after":
-                    delta = row.get("workingset_refault_file_delta", "-1")
-                    try:
-                        d = int(delta)
-                    except ValueError:
-                        d = -1
+                    def _as_int(key):
+                        try:
+                            return int(row.get(key, "-1"))
+                        except (ValueError, TypeError):
+                            return -1
+                    d = _as_int("workingset_refault_file_delta")
+                    t = _as_int("workingset_refault_file_total")
                     if d >= 0:
-                        print(f"  phase {row['phase']}: {d:>12,} pages "
-                              f"({d * 4096 / (1024*1024):8.1f} MiB)")
+                        line = (f"  phase {row['phase']}: "
+                                f"delta {d:>12,} pages ({d * 4096 / (1024*1024):8.1f} MiB)")
+                        if t >= 0:
+                            line += (f"  |  total {t:>12,} pages "
+                                     f"({t * 4096 / (1024*1024):8.1f} MiB)")
+                        print(line)
 
 
 def report_dirty(results_dir):
@@ -259,6 +265,7 @@ def report_cache_hit_miss(results_dir):
             continue
         with open(ts_path) as f:
             start_ts = int(f.read().strip())
+        # 1-second block device reports from iostat -dx 1
         samples = _parse_iostat_samples(iostat_path, start_ts)
 
         print(f"\n**{client_mode}:**")
@@ -276,6 +283,7 @@ def report_cache_hit_miss(results_dir):
             if total_ios <= 0:
                 print(f"  phase {ph}: (no fio read ios recorded)")
                 continue
+            # miss = device reads seen in iostat during the phase window
             misses = min(device_reads, total_ios)
             hits = max(0, total_ios - misses)
             hit_rate = 100.0 * hits / total_ios
