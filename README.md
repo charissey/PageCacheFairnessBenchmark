@@ -335,6 +335,10 @@ tenant's activity churns another's cache.
   *Lower and flatter under interference = better isolation.*
 - **`workingset_refault_file_delta`** — pages re-faulted per phase per cgroup
   (page-cache eviction churn); from `memstat/` (× 4 KiB ≈ bytes re-read).
+- **cachestat(2) `nr_cache` / `nr_recently_evicted`** — per-client file
+  page-cache residency snapshot before/after each phase; from `memstat/`.
+- **`pgfault_delta` / `pgmajfault_delta`** — cgroup `memory.stat` minor/major
+  page faults accrued per phase; from `memstat/`.
 - **PSI (`some`/`full`, memory + io)** — per-cgroup stall time; from `psi/`.
 - **iostat read vs. write latency & queue depth** — surfaces writeback contention.
 - **IOPS / BW** — secondary throughput context, not the objective.
@@ -403,7 +407,9 @@ Results are saved under `benchmark_results/`:
 - **iostat**: `iostat/*.iostat` — device read/write latency & queue depth
 - **PSI**: `psi/*.csv` — per-cgroup memory + io pressure time series
 - **memstat**: `memstat/<client>_<mode>.csv` — per-cgroup `memory.stat` snapshots
-  (`before`/`after` each phase) plus the `workingset_refault_file_delta` rows
+  (`before`/`after` each phase) plus `workingset_refault_file_delta`,
+  `pgfault_delta` / `pgmajfault_delta`, and per-client cachestat(2)
+  `nr_cache` / `nr_recently_evicted` columns
 
 ## 🛠 Troubleshooting
 

@@ -6,7 +6,9 @@ Reads a results directory produced by ./benchmark and reports:
   * IOPS / bandwidth (secondary context)
   * workingset_refault_file_delta per phase per cgroup (from memstat/)
   * dirty-page pressure (from dirty/ — [TODO-3] vmstat + file_dirty samples)
-  * per-cgroup memory.current per phase (from memstat/)
+  * per-cgroup memory.current per phase (from memstat/), plus each client's
+    file cachestat(2) (nr_cache / nr_recently_evicted) and cgroup memory.stat
+    page-fault deltas (pgfault_delta / pgmajfault_delta)
   * approximate cache hit/miss per phase (fio logical reads vs. iostat device
     reads observed during the phase window)
 
@@ -152,28 +154,59 @@ def report_psi(results_dir):
 
 
 def report_memory(results_dir):
-    """Per-cgroup memory.current before/after each phase (from memstat/)."""
-    print("\n## \U0001f4be MEMORY CONSUMPTION (cgroup memory.current)")
+    """Per-cgroup memory.current before/after each phase (from memstat/),
+    plus each client's file cachestat(2) (nr_cache / nr_recently_evicted) and
+    cgroup memory.stat page-fault deltas (pgfault_delta / pgmajfault_delta)."""
+    print("\n## \U0001f4be MEMORY CONSUMPTION (cgroup memory.current + cachestat + page faults)")
     print("=" * 50)
     memstat_dir = os.path.join(results_dir, "memstat")
     files = sorted(glob(os.path.join(memstat_dir, "*.csv")))
     if not files:
         print("  (no memstat csv found — Linux/cgroup v2 only)")
         return
+
+    def _as_int(row, key):
+        try:
+            return int(row.get(key))
+        except (TypeError, ValueError):
+            return None
+
     for path in files:
         name = os.path.basename(path).replace(".csv", "")
         print(f"\n**{name}:**")
         with open(path) as f:
             for row in csv.DictReader(f):
-                cur = row.get("memory_current_bytes")
-                try:
-                    cur_v = int(cur)
-                except (TypeError, ValueError):
-                    continue
-                if cur_v < 0:
+                cur_v = _as_int(row, "memory_current_bytes")
+                if cur_v is None or cur_v < 0:
                     continue
                 mib = cur_v / (1024 * 1024)
-                print(f"  phase {row['phase']} ({row.get('when')}): {mib:9.1f} MiB")
+                line = f"  phase {row['phase']} ({row.get('when')}): {mib:9.1f} MiB"
+
+                # cachestat(2): point-in-time page-cache residency (pages)
+                nr_cache = _as_int(row, "nr_cache")
+                nr_evict = _as_int(row, "nr_recently_evicted")
+                cs_parts = []
+                if nr_cache is not None and nr_cache >= 0:
+                    cs_parts.append(f"nr_cache={nr_cache:,} pages "
+                                    f"({nr_cache * 4096 / (1024*1024):.1f} MiB)")
+                if nr_evict is not None and nr_evict >= 0:
+                    cs_parts.append(f"nr_recently_evicted={nr_evict:,} pages")
+                if cs_parts:
+                    line += "  |  " + "  ".join(cs_parts)
+
+                # page-fault deltas over the phase (only on 'after' rows)
+                if row.get("when") == "after":
+                    pgf = _as_int(row, "pgfault_delta")
+                    pgm = _as_int(row, "pgmajfault_delta")
+                    pf_parts = []
+                    if pgf is not None and pgf >= 0:
+                        pf_parts.append(f"pgfault_delta={pgf:,}")
+                    if pgm is not None and pgm >= 0:
+                        pf_parts.append(f"pgmajfault_delta={pgm:,}")
+                    if pf_parts:
+                        line += "  |  " + "  ".join(pf_parts)
+
+                print(line)
 
 
 def _phase_windows(memstat_path):
