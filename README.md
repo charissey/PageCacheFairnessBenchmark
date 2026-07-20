@@ -43,7 +43,7 @@ pagecachefairnessbenchmark/
 ├── Dockerfile                     # Ubuntu image with fio + build deps
 ├── .dockerignore                  # Keep test files / results out of the image
 ├── benchmark_analysis.py          # Results analysis (fio + PSI + refaults)
-├── benchmark_results/             # Test results directory
+├── results/             # Test results directory
 │   ├── *.json                     # Raw fio output (per phase)
 │   ├── iostat/                    # iostat -x logs
 │   ├── psi/                       # Per-cgroup PSI time series (CSV)
@@ -69,6 +69,7 @@ brew install fio gcc make
 
 ### Install Dependencies (Ubuntu/Debian)
 ```bash
+sudo apt-get update
 sudo apt-get install fio gcc make sysstat
 ```
 
@@ -110,7 +111,7 @@ make                                    # rebuild if you bind-mounted the repo
 ./check_cgroups.sh --cgroup-config cgroup_shared.ini
 ./setup_test_files.sh 1G 8G             # once; ~9 GB on the bind mount
 ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
-./benchmark_analysis.py benchmark_results/
+./benchmark_analysis.py results/
 ```
 
 One-shot dual run (results land on the host via the bind mount):
@@ -150,7 +151,7 @@ io memory
 
 **Notes**
 - Bind-mount the repo (`-v "$PWD:/bench"`) so `test_file_*` and
-  `benchmark_results/` persist on the host and survive container restarts.
+  `results/` persist on the host and survive container restarts.
 - On **Docker Desktop (macOS/Windows)** the container runs in a Linux VM; you
   measure that VM’s page cache, not the Mac/Windows host. Prefer a native
   Linux host or VM for paper-quality I/O numbers.
@@ -287,11 +288,11 @@ concurrently under cgroups — this is the experiment that produces the p99 resu
 ### Run a Single Client (Case 1 baselines)
 
 ```bash
-# A alone
-sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1a client1_steady
+# A alone: cold start in phase 0, then cache persists so phases 1–2 see prior effects
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached --drop-once -o results/case1a client1_steady
 
 # B alone (match phase_0_pattern you use in dual: randread or randwrite)
-sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1b client2_noisy
+sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached --drop-once -o results/case1b client2_noisy
 ```
 
 ### Run Everything
@@ -304,7 +305,7 @@ sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached -o results/case1b
 ### Analyze Results
 ```bash
 # Analyze fairness results
-./benchmark_analysis.py benchmark_results/
+./benchmark_analysis.py results/case*
 ```
 
 ## 📈 Understanding Results
@@ -355,44 +356,63 @@ Edit `fairness_configs.ini` to modify per-phase parameters:
 
 Multi-phase configuration format (phase-prefixed keys; matches checked-in defaults):
 ```ini
-[client1_steady]                 ; Tenant A — the victim
-description = Hot-set sequential reader; report clat p99 (rate-limited SLO signal)
+[client1_steady]
+description = Isolated victim baseline: read 1G once/phase then idle (no aggressor)
 file_size = 1G
-phase_n_pattern = read
-phase_n_block_size = 4k
-phase_n_rate_iops = 10000
-phase_n_iodepth = 1
-phase_n_numjobs = 1
-phase_n_runtime = 60
-phase_n_ioengine = libaio
 
-[client2_noisy]                 ; Tenant B — read neighbor (Mechanism 1 default)
-description = Aggressor: stream 8G file, ramp bandwidth 8m -> 100m -> unlimited to evict client1
-file_size = 8G
-; --- phase 0: light (reads < 500MB) ---
-phase_0_pattern = read        ; sequential stream
-phase_0_block_size = 1M       ; big blocks = high bandwidth per I/O
-phase_0_rate_bw = 8m          ; 8 MiB/s × 60s ≈ 480 MB (< 500MB)
-phase_0_iodepth = 32
+phase_0_pattern = read
+phase_0_block_size = 4k
+phase_0_io_size = 1G
+phase_0_rate_iops = 50000
+phase_0_iodepth = 1
 phase_0_numjobs = 1
-phase_0_runtime = 60          ; time_based (no io_size) → runs the full 60s
+phase_0_runtime = 30
 phase_0_ioengine = libaio
 
-; --- phase 1: crank up (fills + overflows the 2G pool) ---
-phase_1_pattern = read
-phase_1_block_size = 1M
-phase_1_rate_bw = 100m        ; 100 MiB/s × 60s ≈ 6GB → overflows pool
-phase_1_iodepth = 32
+phase_1_pattern = randread
+phase_1_block_size = 4k
+phase_1_io_size = 1G
+phase_1_rate_iops = 50000
+phase_1_iodepth = 1
 phase_1_numjobs = 1
-phase_1_runtime = 60
+phase_1_runtime = 30
 phase_1_ioengine = libaio
 
-; --- phase 2: burst (unlimited; no rate_bw) → evicts everything ---
-phase_2_pattern = read
-phase_2_block_size = 1M
-phase_2_iodepth = 32
+phase_2_pattern = randread
+phase_2_block_size = 4k
+phase_2_io_size = 1G
+phase_2_rate_iops = 50000
+phase_2_iodepth = 1
 phase_2_numjobs = 1
-phase_2_runtime = 60
+phase_2_runtime = 30
+phase_2_ioengine = libaio
+
+[client2_noisy]
+description = Isolated aggressor baseline: stream 8G, ramp bandwidth 1k -> 50k -> 1k
+file_size = 8G
+
+phase_0_pattern = read
+phase_0_block_size = 4k
+phase_0_rate_iops = 1024
+phase_0_iodepth = 1
+phase_0_numjobs = 1
+phase_0_runtime = 30
+phase_0_ioengine = libaio
+
+phase_1_pattern = read
+phase_1_block_size = 4k
+phase_1_rate_iops = 50000
+phase_1_iodepth = 32
+phase_1_numjobs = 4
+phase_1_runtime = 30
+phase_1_ioengine = libaio
+
+phase_2_pattern = read
+phase_2_block_size = 4k
+phase_2_rate_iops = 1024
+phase_2_iodepth = 1
+phase_2_numjobs = 1
+phase_2_runtime = 30
 phase_2_ioengine = libaio
 ```
 
@@ -401,7 +421,7 @@ phase_2_ioengine = libaio
 
 ## 📋 Test Results
 
-Results are saved under `benchmark_results/`:
+Results are saved under `results/`:
 - **JSON**: `*.json` — raw fio output per phase (includes `clat_ns.percentile.99`)
 - **Summary**: `summary.txt` — run summary
 - **iostat**: `iostat/*.iostat` — device read/write latency & queue depth
@@ -439,25 +459,6 @@ make
 ```bash
 # Validate cgroup v2 before running experiments (Linux only)
 sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
-```
-
-## 📊 Example Complete Workflow
-
-```bash
-# 1. Build the benchmark
-make
-
-# 2. Validate cgroup setup (Linux)
-sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
-
-# 3. Run the A + B interference experiment in cached mode
-sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
-
-# 4. Analyze results (fio p99 + PSI + refault deltas)
-./benchmark_analysis.py benchmark_results/
-
-# 5. View summary
-cat benchmark_results/summary.txt
 ```
 
 ## 🎯 What This Benchmark Aims to Show
@@ -545,7 +546,7 @@ The benchmark harness is **implemented and runnable on Linux (cgroup v2)**. Expe
 | `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup) |
 | `setup_test_files.sh` | One-time dense `test_file_1G` / `test_file_8G` (`make setup-files`) |
 | `benchmark_analysis.py` | Summarize fio p99, refault deltas, dirty/vmstat peaks, PSI |
-| `benchmark_results/` | Default output directory (`-o` overrides) |
+| `results/` | Default output directory (`-o` overrides) |
 
 ### Harness
 
@@ -586,6 +587,6 @@ Phase keys: `pattern`, `block_size`, `iodepth`, `numjobs`, `rate_iops`, `runtime
 ```bash
 make
 sudo ./check_cgroups.sh --cgroup-config cgroup_shared.ini
-sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
-./benchmark_analysis.py benchmark_results/
+sudo ./benchmark --cgroup-config cgroup_shared.ini -o results/shared -m cached dual
+./benchmark_analysis.py results/shared
 ```
