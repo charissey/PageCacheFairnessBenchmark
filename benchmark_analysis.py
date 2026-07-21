@@ -6,9 +6,8 @@ Reads a results directory produced by ./benchmark and reports:
   * IOPS / bandwidth (secondary context)
   * workingset_refault_file_delta per phase per cgroup (from memstat/)
   * dirty-page pressure (from dirty/ — [TODO-3] vmstat + file_dirty samples)
-  * per-cgroup memory.current per phase (from memstat/), plus each client's
-    file cachestat(2) (nr_cache / nr_recently_evicted) and cgroup memory.stat
-    page-fault deltas (pgfault_delta / pgmajfault_delta)
+  * per-cgroup memory.current per phase (from memstat/), plus cgroup
+    memory.stat page-fault deltas (pgfault_delta / pgmajfault_delta)
   * approximate cache hit/miss per phase (fio logical reads vs. iostat device
     reads observed during the phase window)
 
@@ -155,9 +154,8 @@ def report_psi(results_dir):
 
 def report_memory(results_dir):
     """Per-cgroup memory.current before/after each phase (from memstat/),
-    plus each client's file cachestat(2) (nr_cache / nr_recently_evicted) and
-    cgroup memory.stat page-fault deltas (pgfault_delta / pgmajfault_delta)."""
-    print("\n## \U0001f4be MEMORY CONSUMPTION (cgroup memory.current + cachestat + page faults)")
+    plus cgroup memory.stat page-fault deltas (pgfault_delta / pgmajfault_delta)."""
+    print("\n## \U0001f4be MEMORY CONSUMPTION (cgroup memory.current + page faults)")
     print("=" * 50)
     memstat_dir = os.path.join(results_dir, "memstat")
     files = sorted(glob(os.path.join(memstat_dir, "*.csv")))
@@ -181,18 +179,6 @@ def report_memory(results_dir):
                     continue
                 mib = cur_v / (1024 * 1024)
                 line = f"  phase {row['phase']} ({row.get('when')}): {mib:9.1f} MiB"
-
-                # cachestat(2): point-in-time page-cache residency (pages)
-                nr_cache = _as_int(row, "nr_cache")
-                nr_evict = _as_int(row, "nr_recently_evicted")
-                cs_parts = []
-                if nr_cache is not None and nr_cache >= 0:
-                    cs_parts.append(f"nr_cache={nr_cache:,} pages "
-                                    f"({nr_cache * 4096 / (1024*1024):.1f} MiB)")
-                if nr_evict is not None and nr_evict >= 0:
-                    cs_parts.append(f"nr_recently_evicted={nr_evict:,} pages")
-                if cs_parts:
-                    line += "  |  " + "  ".join(cs_parts)
 
                 # page-fault deltas over the phase (only on 'after' rows)
                 if row.get("when") == "after":

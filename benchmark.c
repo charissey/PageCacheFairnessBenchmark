@@ -23,11 +23,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
-#include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <dirent.h>
 #include <time.h>
 
@@ -541,42 +539,6 @@ static long read_memstat_field(const char *cgroup_name, const char *field) {
     return found;
 }
 
-/* cachestat(2): point-in-time page-cache residency for a file range.
- * Struct layout mirrors the kernel UAPI; we use local names so the build
- * works even on toolchains whose headers predate the syscall. */
-struct bench_cachestat_range { unsigned long long off; unsigned long long len; };
-struct bench_cachestat {
-    unsigned long long nr_cache;
-    unsigned long long nr_dirty;
-    unsigned long long nr_writeback;
-    unsigned long long nr_evicted;
-    unsigned long long nr_recently_evicted;
-};
-
-/* Snapshot a file's page-cache state via cachestat(2) over the whole file.
- * Fills *nr_cache and *nr_recently_evicted (in pages) and returns 0 on
- * success; on non-Linux, missing syscall, open failure, or ENOSYS returns -1
- * and leaves the outputs untouched. */
-static int read_cachestat(const char *path, long *nr_cache, long *nr_recently_evicted) {
-#if defined(__linux__) && defined(__NR_cachestat)
-    if (!path || !path[0]) return -1;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    struct bench_cachestat_range range = { 0, 0 }; /* len=0 -> to end of file */
-    struct bench_cachestat cs;
-    memset(&cs, 0, sizeof(cs));
-    long rc = syscall(__NR_cachestat, (unsigned int)fd, &range, &cs, 0u);
-    close(fd);
-    if (rc != 0) return -1;
-    if (nr_cache) *nr_cache = (long)cs.nr_cache;
-    if (nr_recently_evicted) *nr_recently_evicted = (long)cs.nr_recently_evicted;
-    return 0;
-#else
-    (void)path; (void)nr_cache; (void)nr_recently_evicted;
-    return -1;
-#endif
-}
-
 /* Read a single-integer cgroup control file, e.g. memory.current. */
 static long read_cgroup_scalar(const char *cgroup_name, const char *filename) {
     if (!is_linux()) return -1;
@@ -601,7 +563,6 @@ static void record_memstat(const char *cgroup_name, const char *client,
                            long prev_refault, long *out_refault,
                            long prev_memcur, long *out_memcur,
                            long base_refault,
-                           const char *test_file,
                            long prev_pgfault, long *out_pgfault,
                            long prev_pgmajfault, long *out_pgmajfault) {
     long refault = read_memstat_field(cgroup_name, "workingset_refault_file");
@@ -615,10 +576,6 @@ static void record_memstat(const char *cgroup_name, const char *client,
     long pgmajfault = read_memstat_field(cgroup_name, "pgmajfault");
     if (out_pgmajfault) *out_pgmajfault = pgmajfault;
 
-    /* cachestat(2): point-in-time page-cache residency for this client's file */
-    long nr_cache = -1, nr_recently_evicted = -1;
-    read_cachestat(test_file, &nr_cache, &nr_recently_evicted);
-
     char dir[MAX_CMD], path[MAX_CMD];
     ensure_subdir(opt.output_dir, "memstat", dir, sizeof(dir));
     snprintf(path, sizeof(path), "%s/%s_%s.csv", dir, client, mode);
@@ -630,8 +587,7 @@ static void record_memstat(const char *cgroup_name, const char *client,
         fprintf(f, "phase,when,wall_time,workingset_refault_file,"
                    "workingset_refault_file_delta,workingset_refault_file_total,"
                    "memory_current_bytes,memory_current_bytes_delta,"
-                   "pgfault,pgfault_delta,pgmajfault,pgmajfault_delta,"
-                   "nr_cache,nr_recently_evicted\n");
+                   "pgfault,pgfault_delta,pgmajfault,pgmajfault_delta\n");
     bool is_after = when && !strcmp(when, "after");
     long delta = (is_after && prev_refault >= 0 && refault >= 0)
                      ? refault - prev_refault : -1;
@@ -644,9 +600,9 @@ static void record_memstat(const char *cgroup_name, const char *client,
                      ? pgfault - prev_pgfault : -1;
     long pgmajdelta = (is_after && prev_pgmajfault >= 0 && pgmajfault >= 0)
                      ? pgmajfault - prev_pgmajfault : -1;
-    fprintf(f, "%d,%s,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
+    fprintf(f, "%d,%s,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld\n",
             phase, when, (long)time(NULL), refault, delta, total, memcur, memdelta,
-            pgfault, pgfdelta, pgmajfault, pgmajdelta, nr_cache, nr_recently_evicted);
+            pgfault, pgfdelta, pgmajfault, pgmajdelta);
     fclose(f);
 }
 
@@ -1034,12 +990,8 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
             prev_pgmajfault[i] = -1;
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
             if (!g) continue;
-            char test_file[MAX_STR] = "";
-            ClientConfig *c = find_client(cfg, client_names[i]);
-            if (c) test_file_for(c, test_file, sizeof(test_file));
             record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "before",
                            -1, &prev_refault[i], -1, &prev_memcur[i], base_refault[i],
-                           test_file,
                            -1, &prev_pgfault[i], -1, &prev_pgmajfault[i]);
         }
 
@@ -1065,12 +1017,8 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
         for (int i = 0; i < n_clients; i++) {
             const CgroupConfig *g = cgset ? cgroup_for_client(cgset, client_names[i]) : NULL;
             if (!g) continue;
-            char test_file[MAX_STR] = "";
-            ClientConfig *c = find_client(cfg, client_names[i]);
-            if (c) test_file_for(c, test_file, sizeof(test_file));
             record_memstat(g->cgroup_name, client_names[i], mode_str, ph, "after",
                            prev_refault[i], NULL, prev_memcur[i], NULL, base_refault[i],
-                           test_file,
                            prev_pgfault[i], NULL, prev_pgmajfault[i], NULL);
         }
     }

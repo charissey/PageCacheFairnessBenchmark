@@ -234,14 +234,14 @@ before it.
 
 ```bash
 # Case 1 — Isolated Baselines (run each client on its own, no contention)
-./benchmark client1_steady
-./benchmark client2_noisy
+sudo ./benchmark -v --drop-once --cgroup-config cgroup_isolated.ini -m cached -o results/client1 client1_steady
+sudo ./benchmark -v --drop-once --cgroup-config cgroup_isolated.ini -m cached -o results/client2 client2_noisy
 
 # Case 2 — Isolated Clients (concurrent, isolated cgroups)
-sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached dual
+sudo ./benchmark -v --drop-once --cgroup-config cgroup_isolated.ini -m cached -o results/cached_isolated dual
 
 # Cases 3-5 — Shared with one cap changed (edit the cgroup .ini, then run)
-sudo ./benchmark --cgroup-config cgroup_shared.ini -m cached dual
+sudo ./benchmark -v --drop-once --cgroup-config cgroup_shared.ini -m cached -o results/cached_dual dual
 ```
 
 For Cases 3-5, change the single `memory.max` line in the cgroup config (keep
@@ -267,45 +267,10 @@ Use `-o <dir>` to send each case to its own results directory (e.g.
 `-o results/case3_shared`) so `benchmark_analysis.py` can compare them
 side by side.
 
-## 🔧 Usage
-
-### Run a Dual-Client Interference Experiment (primary mode)
-
-`dual` mode runs `client1_steady` (Tenant A) and `client2_noisy` (Tenant B)
-concurrently under cgroups — this is the experiment that produces the p99 result.
-
-```bash
-# Run the A + B pairing in BOTH cached and direct modes
-./benchmark dual
-
-# Writer-B interference must run in CACHED mode (direct=1 disables Mechanism 2)
-./benchmark -m cached dual
-
-# With a specific cgroup layout
-./benchmark --cgroup-config cgroup_shared.ini -m cached dual
-```
-
-### Run a Single Client (Case 1 baselines)
-
-```bash
-# A alone: cold start in phase 0, then cache persists so phases 1–2 see prior effects
-sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached --drop-once -o results/case1a client1_steady
-
-# B alone (match phase_0_pattern you use in dual: randread or randwrite)
-sudo ./benchmark --cgroup-config cgroup_isolated.ini -m cached --drop-once -o results/case1b client2_noisy
-```
-
-### Run Everything
-
-```bash
-./benchmark all        # every workload defined in the config
-./benchmark -v all     # verbose
-```
-
 ### Analyze Results
 ```bash
 # Analyze fairness results
-./benchmark_analysis.py results/case*
+./benchmark_analysis.py results/*
 ```
 
 ## 📈 Understanding Results
@@ -336,8 +301,6 @@ tenant's activity churns another's cache.
   *Lower and flatter under interference = better isolation.*
 - **`workingset_refault_file_delta`** — pages re-faulted per phase per cgroup
   (page-cache eviction churn); from `memstat/` (× 4 KiB ≈ bytes re-read).
-- **cachestat(2) `nr_cache` / `nr_recently_evicted`** — per-client file
-  page-cache residency snapshot before/after each phase; from `memstat/`.
 - **`pgfault_delta` / `pgmajfault_delta`** — cgroup `memory.stat` minor/major
   page faults accrued per phase; from `memstat/`.
 - **PSI (`some`/`full`, memory + io)** — per-cgroup stall time; from `psi/`.
@@ -427,9 +390,8 @@ Results are saved under `results/`:
 - **iostat**: `iostat/*.iostat` — device read/write latency & queue depth
 - **PSI**: `psi/*.csv` — per-cgroup memory + io pressure time series
 - **memstat**: `memstat/<client>_<mode>.csv` — per-cgroup `memory.stat` snapshots
-  (`before`/`after` each phase) plus `workingset_refault_file_delta`,
-  `pgfault_delta` / `pgmajfault_delta`, and per-client cachestat(2)
-  `nr_cache` / `nr_recently_evicted` columns
+  (`before`/`after` each phase) plus `workingset_refault_file_delta` and
+  `pgfault_delta` / `pgmajfault_delta` columns
 
 ## 🛠 Troubleshooting
 
