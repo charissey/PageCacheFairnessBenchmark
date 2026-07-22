@@ -320,6 +320,7 @@ static bool parse_cgroup_config(const char *path, CgroupSet *set) {
         if      (!strcmp(key, "cgroup_name")) snprintf(cur->cgroup_name, MAX_STR, "%s", val);
         else if (!strcmp(key, "memory.max"))  snprintf(cur->memory_max, MAX_STR, "%s", val);
         else if (!strcmp(key, "memory.low"))  snprintf(cur->memory_low, MAX_STR, "%s", val);
+        else if (!strcmp(key, "memory.min"))  snprintf(cur->memory_min, MAX_STR, "%s", val);
         else if (!strcmp(key, "io.weight"))   snprintf(cur->io_weight, MAX_STR, "%s", val);
     }
     fclose(f);

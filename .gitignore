@@ -5,6 +5,10 @@ benchmark
 # Generated test files (can be 17+ GB)
 test_file_*
 
+# Results
+benchmark_results/
+results/
+
 # CLion / IDE scaffolding (not part of the benchmark)
 .idea/
 cmake-build-*/
