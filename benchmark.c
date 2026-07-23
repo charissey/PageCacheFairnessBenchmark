@@ -76,6 +76,7 @@ typedef struct {
     char section[MAX_STR];            /* ini section name                    */
     char memory_max[MAX_STR];         /* "" if unset                         */
     char memory_low[MAX_STR];         /* "" if unset                         */
+    char memory_min[MAX_STR];         /* "" if unset                         */
     char io_weight[MAX_STR];          /* "" if unset                         */
 } CgroupConfig;
 
@@ -511,6 +512,7 @@ static bool setup_cgroups(const CgroupSet *set) {
         snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, g->cgroup_name);
         write_cgroup_file(path, "memory.max", g->memory_max);
         write_cgroup_file(path, "memory.low", g->memory_low);
+        write_cgroup_file(path, "memory.min", g->memory_min);
         write_cgroup_file(path, "io.weight",  g->io_weight);
     }
     return true;
