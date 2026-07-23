@@ -817,6 +817,10 @@ static void build_fio_cmd(char *cmd, size_t cap, const ClientConfig *c,
         append(cmd, cap, " --runtime=%d --time_based", p->runtime);
     }
     append(cmd, cap, " --direct=%d", cached ? 0 : 1);
+    /* Cached mode: keep page cache across phases so --drop-once works.
+     * fio defaults to invalidate=1 (FADV_DONTNEED at job start), which
+     * would wipe the warm set every phase. */
+    if (cached) append(cmd, cap, " --invalidate=0");
     append(cmd, cap, " --group_reporting");
 
     /* bandwidth cap */
